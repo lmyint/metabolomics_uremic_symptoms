@@ -1,0 +1,270 @@
+---
+title: "FAIR: Imputation and RUV"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+    
+```{r setup, include=FALSE}
+lib_paths <- .libPaths()
+lib_paths <- c("//win.ad.jhu.edu/Users$/HOME/R/win-library/4.0", lib_paths)
+.libPaths(lib_paths)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center")
+```
+
+# Load packages and read data
+
+Load packages and utility functions.
+
+```{r message=FALSE}
+library(readxl)
+library(tidyverse)
+library(matrixStats)
+library(SummarizedExperiment)
+library(impute)
+library(missForest)
+library(imputeLCMD)
+library(MetNorm) # For RUV
+
+source("functions_utils.R")
+source("functions_qc.R")
+source("functions_imputation.R")
+source("functions_ruv.R")
+
+load("../data/summ_exps_fair_clean.rda")
+```
+
+
+
+
+
+# Covariate imputation
+
+Prepare `colData` for imputation.
+
+- Model formulas:
+    - `symptom+ns(age,df=3)+gender+ns(height,df=3)+ns(dry_weight,df=3)+cv_disease+diabetes+ns(alb,df=3)+ns(hgb,df=3)+ns(ferritin,df=3)+ns(phosph,df=3)+ns(ipth,df=3)`
+- Symptoms studied: "fatigue", "pruritus", "anorexia", "nausea_vomiting", "daytime_sleepiness", "difficulty_concentrating", "bodily_pain"
+
+```{r}
+symptom_grade_to_int <- function(x) {
+    is_graded <- any(str_detect(x, "grade"))
+    is_graded <- ifelse(is.na(is_graded), FALSE, TRUE)
+    if (is_graded) {
+        as.integer(str_remove(x, "grade"))
+    } else {
+        as.integer(str_extract(x, "^[0-9]+"))
+    }
+}
+
+## Obtain relevant colData
+col_data <- colData(se_c8_fair_main) %>%
+    as.data.frame() %>%
+    as_tibble() %>%
+    select(-(date_extracted:raw_file_name), -ends_with("_dt"), -c(sample_id, can_dgn, rec_dgn), -starts_with("nmissing_"), -starts_with("lab_dt"), -starts_with("lab_label")) %>%
+    mutate(across(qol1:qol24b, symptom_grade_to_int))
+
+for (var in c("alb", "hgb", "ferritin", "phosph", "ipth")) {
+    plot(density(col_data[[var]], na.rm = TRUE, from = min(col_data[[var]], na.rm = TRUE)), xlab = "", ylab = "", main = var)
+}
+
+col_data <- col_data %>%
+    mutate(across(c(ferritin, ipth), log))
+```
+
+Manually drop observations and run RF imputation.
+
+- The error "Error in sample.int(length(x), size, replace, prob) : 
+invalid first argument" is a bug.
+- The non-lab covariates have so few missing values that imputation isn't necessary.
+- The labs have such high missingness that imputation would likely be inaccurate and we wouldn't want to include labs anyway.
+
+```{r eval=FALSE}
+## Choose subset of variables in which to manually create NAs
+vars_to_drop <- c("alb", "hgb", "ferritin", "phosph", "ipth")
+
+## Record variable types for ALL variables
+col_types <- c("c", "q", rep("c", 4), rep("q", 3), rep("c", 3), "q", rep("c", 17), rep("q", 121), "c")
+
+## Manually create missing data and turn categorical vars into factors
+set.seed(86)
+col_data_na <- create_missingness(col_data, cols = vars_to_drop, num = 1, method = "mcar")
+col_data_na_recode <- col_data_na
+for (i in seq_len(ncol(col_data_na_recode))) {
+    if (col_types[i] == "c") {
+        col_data_na_recode[[i]] <- as.factor(col_data_na_recode[[i]])
+        col_data[[i]] <- as.factor(col_data[[i]])
+    }
+}
+
+## Remove variables that are all NAs
+bool_high_miss <- colSums(is.na(col_data_na_recode)) > 0.8*nrow(col_data)
+
+## Run RF imputation
+col_data_na_mf <- missForest(col_data_na_recode[,!bool_high_miss], variablewise = TRUE)
+```
+
+
+
+
+
+# Metabolomics missing data explorations
+
+Investigate missingness by metabolite.
+
+```{r}
+missing_data_metab(se_c8_fair_main)
+missing_data_metab(se_hilic_pos_fair_main)
+missing_data_metab(se_hilic_neg_fair_main)
+```
+
+Investigate missingness by sample. No samples are outliers in terms of missingness --> don't need to remove any samples for this reason.
+
+```{r}
+missing_data_samples(se_c8_fair_main)
+missing_data_samples(se_hilic_pos_fair_main)
+missing_data_samples(se_hilic_neg_fair_main)
+```
+
+
+
+
+
+# Imputation of metabolomics data
+
+Evaluate different imputation methods on metabolomics data.
+
+```{r cache=TRUE}
+set.seed(139)
+eval_imp_c8 <- evaluate_imp_methods_metab(se_c8_fair_main)
+
+set.seed(142)
+eval_imp_hilic_pos <- evaluate_imp_methods_metab(se_hilic_pos_fair_main)
+
+set.seed(145)
+eval_imp_hilic_neg <- evaluate_imp_methods_metab(se_hilic_neg_fair_main)
+```
+
+Compare imputation methods.
+
+```{r}
+imp_errors <- bind_rows(
+    list("C8" = eval_imp_c8$errors, "HILIC-pos" = eval_imp_hilic_pos$errors, "HILIC-neg" = eval_imp_hilic_pos$errors),
+    .id = "Injection"
+)
+```
+
+```{r}
+ggplot(imp_errors, aes(x = error, color = imp_method)) +
+    geom_density() +
+    facet_grid(. ~ Injection) +
+    theme_classic() +
+    labs(x = "Imputation error", color = "Imputation\nmethod")
+ggplot(imp_errors, aes(x = imp_method, color = imp_method, y = error)) +
+    geom_boxplot() +
+    facet_grid(. ~ Injection) +
+    theme_classic() +
+    labs(x = "Imputation method", y = "Imputation error") +
+    guides(color = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+Run imputation methods on original metabolomics data.
+
+```{r}
+set.seed(128)
+se_c8_fair_main <- impute_metab(se_c8_fair_main)
+se_hilic_pos_fair_main <- impute_metab(se_hilic_pos_fair_main)
+se_hilic_neg_fair_main <- impute_metab(se_hilic_neg_fair_main)
+```
+
+
+
+
+
+# RUV
+
+Pre-ruv explorations to choose k and negative controls. I use `which_log_abund = NULL` (amounting to imputing zeros for NAs) for these explorations instead of repeating these explorations for different imputed versions. Why?
+
+- Only the choice of k is affected by the choice of `which_log_abund`. (Choice of empirical standards is done on the original NA-filled abundance matrix.)
+    - Should be affected very little because there is almost no missing data for the chosen standards.
+
+```{r}
+idx_ctrls_c8 <- pre_ruv_explorations(se_c8_fair_main)
+idx_ctrls_hilic_pos <- pre_ruv_explorations(se_hilic_pos_fair_main)
+idx_ctrls_hilic_neg <- pre_ruv_explorations(se_hilic_neg_fair_main)
+```
+
+```{r cache=TRUE}
+imp_methods <- c("imp_zero", "imp_half_min", "imp_qrilc")
+se_list <- list(c8 = se_c8_fair_main, hilic_pos = se_hilic_pos_fair_main, hilic_neg = se_hilic_neg_fair_main)
+ctrls_list <- list(c8 = idx_ctrls_c8, hilic_pos = idx_ctrls_hilic_pos, hilic_neg = idx_ctrls_hilic_neg)
+
+set.seed(204)
+ruv_results <- lapply(imp_methods, function(imp_meth) {
+    lapply(names(se_list), function(injection) {
+        this_se <- se_list[[injection]]
+        this_ctrls <- ctrls_list[[injection]]
+        ruv_result <- implement_ruv(se = this_se, which_log_abund = imp_meth, idx_all_standards = this_ctrls, k = 3)
+    })
+})
+names(ruv_results) <- imp_methods
+```
+
+Look at plots and metrics to decide on best RUV-imputation combination.
+
+- It seems that **`QRILC`** imputation results in lower variance explained by the first few PCs, which likely indicates reduced presence of unwanted variation/batch effects.
+
+```{r fig.width=12}
+par(mfrow = c(3,2))
+for (imp_meth in imp_methods) {
+    ## Store RUV results (temporarily) in log_abund_ruv assay
+    assay(se_c8_fair_main, "log_abund_ruv") <- t(ruv_results[[imp_meth]][[1]]$newY)
+    assay(se_hilic_pos_fair_main, "log_abund_ruv") <- t(ruv_results[[imp_meth]][[2]]$newY)
+    assay(se_hilic_neg_fair_main, "log_abund_ruv") <- t(ruv_results[[imp_meth]][[3]]$newY)
+    
+    ## Plot PCA output
+    plot_pc_info(
+        se_c8_fair_main,
+        sample_descrip = paste("C8 - RUV:", imp_meth),
+        which_log_abund = "log_abund_ruv"
+    )
+    plot_pc_info(
+        se_hilic_pos_fair_main,
+        sample_descrip = paste("HILIC-pos - RUV:", imp_meth),
+        which_log_abund = "log_abund_ruv"
+    )
+    plot_pc_info(
+        se_hilic_neg_fair_main,
+        sample_descrip = paste("HILIC-neg - RUV:", imp_meth),
+        which_log_abund = "log_abund_ruv"
+    )
+}
+```
+
+Store QRILC-RUV results in `SummarizedExperiment` objects.
+
+```{r}
+# log_abund_ruv assay slot is no longer needed (was just a placeholder for visualizations above)
+assay(se_c8_fair_main, "log_abund_ruv") <- NULL
+assay(se_hilic_pos_fair_main, "log_abund_ruv") <- NULL
+assay(se_hilic_neg_fair_main, "log_abund_ruv") <- NULL
+
+# Store QRILC-RUV results
+assay(se_c8_fair_main, "log_abund_ruv_qrilc") <- t(ruv_results[["imp_qrilc"]][[1]]$newY)
+assay(se_hilic_pos_fair_main, "log_abund_ruv_qrilc") <- t(ruv_results[["imp_qrilc"]][[2]]$newY)
+assay(se_hilic_neg_fair_main, "log_abund_ruv_qrilc") <- t(ruv_results[["imp_qrilc"]][[3]]$newY)
+```
+
+
+
+
+
+# Save data
+
+```{r}
+save(se_c8_fair_main, se_hilic_pos_fair_main, se_hilic_neg_fair_main, file = "../data/summ_exps_fair_imputed_ruv.rda")
+```
+
+

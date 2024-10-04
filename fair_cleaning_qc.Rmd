@@ -1,0 +1,439 @@
+---
+title: "FAIR: Data Cleaning and QC Checks"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+    
+```{r setup, include=FALSE}
+lib_paths <- .libPaths()
+lib_paths <- c("//win.ad.jhu.edu/Users$/HOME/R/win-library/4.0", lib_paths)
+.libPaths(lib_paths)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center", fig.width=12)
+```
+
+# Load packages and read data
+
+Load packages and utility functions.
+
+```{r message=FALSE}
+library(SummarizedExperiment)
+library(matrixStats)
+library(readxl)
+library(tidyverse)
+library(lubridate)
+
+source("functions_utils.R")
+source("functions_qc.R")
+```
+
+Read in metabolomics data.
+
+```{r}
+se_c8_fair <- read_broad_data(
+    file = "../data/Hopkins FAIR Study Data/Broad/22_0825_uremic_symptoms_C8-pos.xlsx", 
+    range_abund = "I10:PI5127", 
+    range_row_data = "A9:H5127", 
+    range_col_data = "A1:I418",
+    injection = "C8"
+)
+
+se_hilic_pos_fair <- read_broad_data(
+    file = "../data/Hopkins FAIR Study Data/Broad/22_0825_uremic_symptoms_HILIC-pos.xlsx", 
+    range_abund = "H10:PH9654", 
+    range_row_data = "A9:G9654", 
+    range_col_data = "A1:I418",
+    injection = "HILIC-pos"
+)
+
+se_hilic_neg_fair <- read_broad_data(
+    file = "../data/Hopkins FAIR Study Data/Broad/22_0825_uremic_symptoms_HILIC-neg.xlsx", 
+    range_abund = "I10:PK2071", 
+    range_row_data = "A9:H2071", 
+    range_col_data = "A1:I420",
+    injection = "HILIC-neg"
+)
+```
+
+Split `SummarizedExperiment` objects into main study samples and QC samples.
+
+```{r}
+se_c8_fair_split <- split_experiment(se_c8_fair)
+se_hilic_pos_fair_split <- split_experiment(se_hilic_pos_fair)
+se_hilic_neg_fair_split <- split_experiment(se_hilic_neg_fair)
+
+se_c8_fair_main <- se_c8_fair_split$main
+se_hilic_pos_fair_main <- se_hilic_pos_fair_split$main
+se_hilic_neg_fair_main <- se_hilic_neg_fair_split$main
+```
+
+Read in outcome and covariate data.
+
+```{r}
+fair <- read_excel("../data/Hopkins FAIR Study Data/Original.Data from Olivia/Updated.05042022/FAIR Metabolomics_KDQOL_20220504.xlsx", range = "A1:GK374")
+```
+
+
+
+
+
+# Check sample sizes and IDs
+
+Check sample sizes.
+
+```{r}
+dim(fair)
+dim(se_c8_fair_main)
+dim(se_hilic_pos_fair_main)
+dim(se_hilic_neg_fair_main)
+```
+
+There is one more sample in the covariate data than in the Broad data. What is the mismatch?
+
+```{r}
+setdiff(fair$fairid, colData(se_c8_fair_main)$sample_id)
+setdiff(fair$fairid, colData(se_hilic_pos_fair_main)$sample_id)
+setdiff(fair$fairid, colData(se_hilic_neg_fair_main)$sample_id)
+```
+
+
+
+
+
+# Summary statistics across covariates
+
+`hea5a`: MI
+`hea5b`: peripheral vascular disease
+`hea5c`: cerebral vascular disease
+`hea5h`: diabetes
+`hea5o`: Congestive heart failure
+
+`lab_value12`: albumin (g/dL)
+`lab_value10`: HGB (g/dL)
+`lab_value15`: FERRITIN (ng/mL)
+`lab_value14`: PHOS (mg/dL)
+`lab_value16`: PTH (pg/mL)
+
+```{r}
+fair <- fair %>%
+    dplyr::rename(
+        mi = hea5a,
+        pvd = hea5b,
+        cvd = hea5c,
+        diabetes = hea5h,
+        chf = hea5o,
+        alb = lab_value12,
+        hgb = lab_value10,
+        ferritin = lab_value15,
+        phosph = lab_value14,
+        ipth = lab_value16
+    ) %>% 
+    mutate(cv_disease = mi=="Yes" | pvd=="Yes" | cvd=="Yes" | chf=="Yes")
+
+variables <- c("age", "sex", "race_eth", "ht_cm", "wt_kg", "bmi", "mi", "pvd", "cvd", "chf", "cv_disease", "diabetes", "alb", "hgb", "ferritin", "phosph", "ipth")
+variable_types <- c("q", "c", "c", rep("q", 3), rep("c", 6), rep("q", 5))
+
+for (i in seq_along(variables)) {
+    var <- variables[i]
+    cat(var, "-------------------------------------------:\n")
+    if (variable_types[i]=="c")
+        fair %>% count(.data[[var]]) %>% print()
+    else {
+        print(summary(fair[[var]]))
+    }
+}
+```
+
+
+
+
+
+# Cleaning symptom information
+
+## Select and rename symptoms of interest
+
+"During the past 4 weeks, to what extent were you bothered by..."
+
+Main symptoms
+
+- Fatigue: Being washed out or drained?
+    - `qol14i`: 14.I. Washed out or drained?
+- Pruritus: Itchy skin?
+    - `qol14d`: 14.D. Itchy skin?
+- Anorexia: Lack of appetite?
+    - `qol14h`: 14.H. Lack of appetite?
+
+Secondary symptoms
+
+- Nausea/Vomiting: Nausea or upset stomach?
+    - `qol14k`: 14.K. Nausea or upset stomach?
+- Excessive daytime sleep: Sleepiness during the day?
+    - `qol18c`: 18.C. Have trouble staying awake during the day?
+- Difficulty concentrating: Difficulty doing activities involving concentrating and thinking?
+    - `qol13d`: 13.D. Did you have difficulty concentrating or thinking?
+- Pain: Bodily pain?
+    - `qol7`: 7. How much bodily pain have you had during the past 4 weeks? 
+
+Extra variables related to fatigue
+
+- Climbing one flight of stairs
+    - `qol3e`: 3.E. Climbing one flight of stairs.
+- Climbing several flights of stairs
+    - `qol3d`: 3.D. Climbing several flights of stairs. 
+- Moderate activity
+    - `qol3b`: 3.B. Moderate activities, such as moving a table, pushing a vacuum cleaner, bowl
+- Vigorous activity
+    - `qol3a`: 3.A. Vigorous activities, such as running, lifting heavy objects, participating 
+- Walking one block
+    - `qol3i`: 3.I. Walking one block.
+- Walking several blocks
+    - `qol3h`: 3.H. Walking several blocks.
+- Walking a mile or more
+    - `qol3g`: 3.G. Walking more than a mile.
+
+Rename (abbreviate) variables for symptoms of interest.
+
+```{r}
+fair <- fair %>%
+    dplyr::rename(
+        fatigue = qol14i,
+        pruritus = qol14d,
+        anorexia = qol14h,
+        nausea_vomiting = qol14k,
+        daytime_sleepiness = qol18c,
+        difficulty_concentrating = qol13d,
+        bodily_pain = qol7,
+        climb_one_flight = qol3e,
+        climb_several_flights = qol3d,
+        moderate_activity = qol3b,
+        vigorous_activity = qol3a,
+        walk_one_block = qol3i,
+        walk_several_blocks = qol3h,
+        walk_mile_more = qol3g
+    )
+```
+
+What are the possible responses for the selected symptoms?
+
+```{r}
+fair %>% dplyr::count(fatigue)
+fair %>% dplyr::count(pruritus)
+fair %>% dplyr::count(anorexia)
+fair %>% dplyr::count(nausea_vomiting)
+fair %>% dplyr::count(daytime_sleepiness)
+fair %>% dplyr::count(difficulty_concentrating)
+fair %>% dplyr::count(bodily_pain)
+
+fair %>% dplyr::count(climb_one_flight)
+fair %>% dplyr::count(climb_several_flights)
+fair %>% dplyr::count(moderate_activity)
+fair %>% dplyr::count(vigorous_activity)
+fair %>% dplyr::count(walk_one_block)
+fair %>% dplyr::count(walk_several_blocks)
+fair %>% dplyr::count(walk_mile_more)
+```
+
+## Recode categories for symptoms
+
+```{r}
+recode_categories <- function(x, type = c("type1", "type2", "type3", "type4")) {
+    if (type=="type1") {
+        case_when(
+            x=="1. Not at all bothered" ~ "grade1",
+            x=="2. Somewhat bothered" ~ "grade2",
+            x=="3. Moderately bothered" ~ "grade3",
+            x=="4. Very much bothered" ~ "grade4",
+            x=="5. Extremely bothered" ~ "grade5"
+        )
+    } else if (type=="type2") {
+        case_when(
+            x=="1. None of the time" ~ "grade1",
+            x=="2. A little of the time" ~ "grade2",
+            x=="3. Some of the time" ~ "grade3",
+            x=="4. A good bit of the time" ~ "grade4",
+            x=="5. Most of the time" ~ "grade5",
+            x=="6. All of the time" ~ "grade6"
+        )
+    } else if (type=="type3") {
+        case_when(
+            x=="1. None" ~ "grade1",
+            x=="2. Very mild" ~ "grade2",
+            x=="3. Mild" ~ "grade3",
+            x=="4. Moderate" ~ "grade4",
+            x=="5. Severe" ~ "grade5",
+            x=="6. Very Severe" ~ "grade6"
+        )
+    } else if (type=="type4") {
+        case_when(
+            x=="3. No, not limited at all" ~ "grade1",
+            x=="2. Yes, limited a little" ~ "grade2",
+            x=="1. Yes, limited a lot" ~ "grade3"
+        )
+    }
+}
+
+fair_new <- fair %>%
+    mutate(across(c(fatigue, pruritus, anorexia, nausea_vomiting), recode_categories, type = "type1")) %>%
+    mutate(across(c(daytime_sleepiness, difficulty_concentrating), recode_categories, type = "type2")) %>%
+    mutate(bodily_pain = recode_categories(bodily_pain, type = "type3")) %>%
+    mutate(across(c(climb_one_flight, climb_several_flights, moderate_activity, vigorous_activity, walk_one_block, walk_several_blocks, walk_mile_more), recode_categories, type = "type4"))
+```
+
+
+
+
+
+# Merge covariate data into SummarizedExperiments
+
+```{r}
+merge_se_covars <- function(se, df_covariates) {
+    cd <- colData(se) %>% as.data.frame()
+    cd <- cd %>%
+        left_join(df_covariates, by = c("sample_id" = "fairid"))
+    colData(se) <- as(cd, "DataFrame")
+    se
+}
+
+se_c8_fair_main <- merge_se_covars(se_c8_fair_main, fair_new)
+se_hilic_pos_fair_main <- merge_se_covars(se_hilic_pos_fair_main, fair_new)
+se_hilic_neg_fair_main <- merge_se_covars(se_hilic_neg_fair_main, fair_new)
+```
+
+
+
+
+
+# QC: Sample drift and batch effects
+
+## Sample drift for QC samples
+
+```{r}
+plot_qc_drift(se_c8_fair_split$main, sample_descrip = "C8 - Main", include_subtitle_corr = TRUE)
+plot_qc_drift(se_c8_fair_split$qc_a, sample_descrip = "C8 - PREFA", include_subtitle_corr = TRUE)
+plot_qc_drift(se_c8_fair_split$qc_b, sample_descrip = "C8 - PREFB", include_subtitle_corr = TRUE)
+plot_qc_drift(se_c8_fair_split$lucid_pool, sample_descrip = "C8 - LUCID pool", include_subtitle_corr = TRUE)
+
+plot_qc_drift(se_hilic_pos_fair_split$main, sample_descrip = "HILIC-pos - Main", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_pos_fair_split$qc_a, sample_descrip = "HILIC-pos - PREFA", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_pos_fair_split$qc_b, sample_descrip = "HILIC-pos - PREFB", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_pos_fair_split$lucid_pool, sample_descrip = "HILIC-pos - LUCID pool", include_subtitle_corr = TRUE)
+
+plot_qc_drift(se_hilic_neg_fair_split$main, sample_descrip = "HILIC-neg - Main", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_neg_fair_split$qc_a, sample_descrip = "HILIC-neg - PREFA", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_neg_fair_split$qc_b, sample_descrip = "HILIC-neg - PREFB", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_neg_fair_split$lucid_pool, sample_descrip = "HILIC-neg - LUCID pool", include_subtitle_corr = TRUE)
+```
+
+
+## Coefficient of variation distributions
+
+```{r}
+plot_cv_dists(se_c8_fair_split, "C8", xlim = c(0,1))
+plot_cv_dists(se_hilic_pos_fair_split, "HILIC (pos)", xlim = c(0,10))
+plot_cv_dists(se_hilic_neg_fair_split, "HILIC (neg)", xlim = c(0,10))
+```
+
+
+## PCA
+
+### C8
+
+```{r}
+plot_pc_info(se_c8_fair_split$main, sample_descrip = "C8: Main")
+plot_pc_info(se_c8_fair_split$qc_a, sample_descrip = "C8: PREFA")
+plot_pc_info(se_c8_fair_split$qc_b, sample_descrip = "C8: PREFB")
+```
+
+
+### HILIC-pos
+
+```{r}
+plot_pc_info(se_hilic_pos_fair_split$main, sample_descrip = "HILIC (pos): Main")
+plot_pc_info(se_hilic_pos_fair_split$qc_a, sample_descrip = "HILIC (pos): PREFA")
+plot_pc_info(se_hilic_pos_fair_split$qc_b, sample_descrip = "HILIC (pos): PREFB")
+```
+
+
+### HILIC-neg
+
+```{r}
+plot_pc_info(se_hilic_neg_fair_split$main, sample_descrip = "HILIC (neg): Main")
+plot_pc_info(se_hilic_neg_fair_split$qc_a, sample_descrip = "HILIC (neg): PREFA")
+plot_pc_info(se_hilic_neg_fair_split$qc_b, sample_descrip = "HILIC (neg): PREFB")
+```
+
+
+
+
+
+# Metabolite redundancy across injections
+
+Read in Eugene's annotations.
+
+```{r}
+metab_redundancy <- read_excel("../data/Broad data--redundant metabolites_02032022.xlsx", sheet = "Sheet1", range = "A1:I665", col_names = TRUE)
+colnames(metab_redundancy) <- fix_names(colnames(metab_redundancy))
+metab_redundancy <- metab_redundancy %>% select(-`...6`)
+```
+
+What metabolites are measured in multiple injections?
+
+```{r}
+metabs_c8 <- setdiff(rowData(se_c8_fair_main)$metabolite, NA)
+metabs_hilic_pos <- setdiff(rowData(se_hilic_pos_fair_main)$metabolite, NA)
+metabs_hilic_neg <- setdiff(rowData(se_hilic_neg_fair_main)$metabolite, NA)
+df_metabs_by_method <- tibble(
+    all_metabs = unique(c(metabs_c8, metabs_hilic_pos, metabs_hilic_neg)),
+    c8 = all_metabs %in% metabs_c8,
+    hil_pos = all_metabs %in% metabs_hilic_pos,
+    hil_neg = all_metabs %in% metabs_hilic_neg
+)
+
+df_metabs_by_method[rowSums(df_metabs_by_method[,2:4]) > 1,]
+```
+
+Remove redundant metabolites across injections.
+
+- **Note:** the `metabolite` column contains new nomenclature, so the metabolite names in this column don't match Eugene's annotation from the LUCID files. The C8 and HILIC-neg injections have a `former_nomenclature` column that 
+
+```{r}
+se_c8_fair_main <- remove_metabolites(se_c8_fair_main, metab_redundancy, injection = "C8-pos", row_data_col = "former_nomenclature")
+se_hilic_pos_fair_main <- remove_metabolites(se_hilic_pos_fair_main, metab_redundancy, injection = "HIL-pos", row_data_col = "metabolite")
+se_hilic_neg_fair_main <- remove_metabolites(se_hilic_neg_fair_main, metab_redundancy, injection = "HIL-neg", row_data_col = "former_nomenclature")
+```
+
+
+# Save data before filtering metabolites
+
+```{r}
+save(se_c8_fair_main, se_hilic_pos_fair_main, se_hilic_neg_fair_main, file = "../data/summ_exps_fair_clean_pre_filter.rda")
+```
+
+
+
+
+# Filtering metabolites based on missingness and zero variance
+
+- Remove metabolites with >= 95% missingness
+- Remove metabolites where the variance in abundance among non-missing values is zero
+
+```{r}
+se_c8_fair_main <- filter_metabs(se_c8_fair_main)
+se_hilic_pos_fair_main <- filter_metabs(se_hilic_pos_fair_main)
+se_hilic_neg_fair_main <- filter_metabs(se_hilic_neg_fair_main)
+```
+
+
+
+
+
+# Save clean data
+
+```{r}
+save(se_c8_fair_main, se_hilic_pos_fair_main, se_hilic_neg_fair_main, file = "../data/summ_exps_fair_clean.rda")
+```
+
+
+
+

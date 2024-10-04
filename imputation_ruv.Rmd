@@ -1,0 +1,371 @@
+---
+title: "LUCID: Imputation and RUV"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+    
+```{r setup, include=FALSE}
+lib_paths <- .libPaths()
+lib_paths <- c("//win.ad.jhu.edu/Users$/HOME/R/win-library/4.0", lib_paths)
+.libPaths(lib_paths)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center")
+```
+
+# Load packages and read data
+
+Load packages and utility functions.
+
+```{r message=FALSE}
+library(readxl)
+library(tidyverse)
+library(matrixStats)
+library(SummarizedExperiment)
+# library(Amelia)
+library(impute)
+library(missForest)
+library(imputeLCMD)
+library(MetNorm) # For RUV
+
+source("functions_utils.R")
+source("functions_qc.R")
+source("functions_imputation.R")
+source("functions_ruv.R")
+
+load("../data/summ_exps_clean.rda")
+```
+
+
+
+
+
+# Covariate imputation
+
+```{r}
+colData(se_c8_main) %>%
+    as.data.frame() %>%
+    filter(country=="Canada" | frenova, event_name=="Baseline") %>%
+    select(dialysis_duration, date_of_first_dialysis, date_sample_collected) %>%
+    mutate(
+        miss_dur = is.na(dialysis_duration),
+        miss_first = is.na(date_of_first_dialysis),
+        miss_collect = is.na(date_sample_collected)
+    ) %>%
+    dplyr::count(miss_dur, miss_first, miss_collect)
+
+colData(se_c8_main) %>%
+    as.data.frame() %>%
+    filter(country=="Canada" | frenova, event_name=="Baseline", is.na(dialysis_duration)) %>%
+    pull(proton_id)
+```
+
+Investigating if mortality outcome helps prediction of labs.
+
+```{r}
+col_data <- colData(se_c8_main) %>%
+    as.data.frame() %>%
+    mutate(
+        mort_outcome = daysdeath <= 365 & !is.na(daysdeath),
+        daysdeath_cens = ifelse(is.na(daysdeath), 730, daysdeath)
+    )
+
+ggplot(col_data, aes(x = mort_outcome, y = log(alb))) + geom_boxplot() + theme_classic()
+ggplot(col_data, aes(x = mort_outcome, y = log(hgb))) + geom_boxplot() + theme_classic()
+ggplot(col_data, aes(x = mort_outcome, y = log(ferritin))) + geom_boxplot() + theme_classic()
+ggplot(col_data, aes(x = mort_outcome, y = log(phosph))) + geom_boxplot() + theme_classic()
+ggplot(col_data, aes(x = mort_outcome, y = log(ipth))) + geom_boxplot() + theme_classic()
+ggplot(col_data, aes(x = mort_outcome, y = log(ktv))) + geom_boxplot() + theme_classic()
+
+ggplot(col_data, aes(x = daysdeath_cens, y = log(alb))) + geom_point() + geom_smooth() + theme_classic()
+ggplot(col_data, aes(x = daysdeath_cens, y = log(hgb))) + geom_point() + geom_smooth() + theme_classic()
+ggplot(col_data, aes(x = daysdeath_cens, y = log(ferritin))) + geom_point() + geom_smooth() + theme_classic()
+ggplot(col_data, aes(x = daysdeath_cens, y = log(phosph))) + geom_point() + geom_smooth() + theme_classic()
+ggplot(col_data, aes(x = daysdeath_cens, y = log(ipth))) + geom_point() + geom_smooth() + theme_classic()
+ggplot(col_data, aes(x = daysdeath_cens, y = log(ktv))) + geom_point() + geom_smooth() + theme_classic()
+```
+
+Prepare `colData` for imputation.
+
+- Model formulas:
+    - `symptom+ns(age,df=3)+gender+ns(height,df=3)+ns(dry_weight,df=3)+cv_disease+diabetes+ns(alb,df=3)+ns(hgb,df=3)+ns(ferritin,df=3)+ns(phosph,df=3)+ns(ipth,df=3)`
+    - `mort_outcome+age+gender+race+cv_disease+diabetes+ns(bmi,df=3)+ns(alb,df=3)+ns(ktv,df=3)+ns(dialysis_duration,df=3)`
+- Symptoms studied: "fatigue", "pruritus", "anorexia", "nausea_vomiting", "daytime_sleepiness", "difficulty_concentrating", "bodily_pain"
+
+```{r}
+symptom_grade_to_int <- function(x) {
+    as.integer(str_remove(x, "grade"))
+}
+
+## Obtain relevant colData
+col_data <- colData(se_c8_main) %>%
+    as.data.frame() %>%
+    mutate(
+        mort_outcome = daysdeath <= 365 & !is.na(daysdeath),
+        daysdeath_cens = ifelse(is.na(daysdeath), 730, daysdeath)
+    ) %>%
+    select(fatigue, pruritus, anorexia, nausea_vomiting, daytime_sleepiness, difficulty_concentrating, bodily_pain, climb_one_flight, climb_several_flights, moderate_activity, vigorous_activity, walk_one_block, walk_several_blocks, walk_mile_more, age, gender, race, height, dry_weight, bmi, cv_disease, diabetes, alb, hgb, ferritin, phosph, ipth, ktv, dialysis_duration, mort_outcome, daysdeath, daysdeath_cens) %>%
+    mutate(across(fatigue:walk_mile_more, symptom_grade_to_int))
+
+for (var in c("alb", "hgb", "ferritin", "phosph", "ipth", "ktv")) {
+    plot(density(col_data[[var]], na.rm = TRUE, from = min(col_data[[var]], na.rm = TRUE)), xlab = "", ylab = "", main = var)
+}
+
+col_data <- col_data %>%
+    mutate(across(alb:ipth, log))
+```
+
+Manually drop observations and run RF imputation.
+
+```{r}
+## Choose subset of variables in which to manually create NAs
+vars_to_drop <- setdiff(colnames(col_data), c("climb_one_flight", "climb_several_flights", "moderate_activity", "vigorous_activity", "walk_one_block", "walk_several_blocks", "walk_mile_more", "age", "gender", "race", "height", "dry_weight", "dialysis_duration", "mort_outcome", "daysdeath", "daysdeath_cens"))
+
+## Record variable types for ALL variables
+col_types <- c(rep("q", 15), rep("c", 2), rep("q", 3), rep("c", 2), rep("q", 7), "c", rep("q", 2))
+
+## Manually create missing data and turn categorical vars into factors
+set.seed(57)
+col_data_na <- create_missingness(col_data, cols = vars_to_drop, num = 20, method = "mcar")
+col_data_na_recode <- col_data_na
+for (i in seq_len(ncol(col_data_na_recode))) {
+    if (col_types[i] == "c") {
+        col_data_na_recode[[i]] <- as.factor(col_data_na_recode[[i]])
+        col_data[[i]] <- as.factor(col_data[[i]])
+    }
+}
+
+## Run RF imputation
+col_data_na_mf <- missForest(col_data_na_recode, variablewise = TRUE)
+```
+
+Evaluate imputation.
+
+```{r}
+mf_err_results <- get_imputation_error(
+    data_truth = col_data,
+    data_forced_na = col_data_na,
+    data_imputed = col_data_na_mf$ximp,
+    col_types = col_types
+)
+
+mf_err_results
+```
+
+Impute full data.
+
+```{r}
+col_data_mf <- missForest(col_data, variablewise = TRUE)
+```
+
+Reformat symptom variables in imputed data to be categorical (e.g., "grade3"). Make sure that rounding the imputed symptom grade does not create a new highest category (max grade should stay the same between imputed and unimputed).
+
+```{r}
+num_to_grade <- function(x) {
+    paste0("grade", as.integer(round(x)))
+}
+
+col_data_mf <- col_data_mf$ximp %>%
+    mutate(across(fatigue:bodily_pain, num_to_grade))
+
+col_data_mf %>% dplyr::count(fatigue)
+col_data_mf %>% dplyr::count(pruritus)
+col_data_mf %>% dplyr::count(anorexia)
+col_data_mf %>% dplyr::count(nausea_vomiting)
+col_data_mf %>% dplyr::count(daytime_sleepiness)
+col_data_mf %>% dplyr::count(difficulty_concentrating)
+col_data_mf %>% dplyr::count(bodily_pain)
+```
+
+Add imputed variables back in to `colData` with modified names (append "_imp" to end of variable name).
+
+```{r}
+colnames(col_data_mf) <- paste0(colnames(col_data_mf), "_imp")
+
+col_data_c8 <- colData(se_c8_main) %>% as.data.frame()
+col_data_hilic_pos <- colData(se_hilic_pos_main) %>% as.data.frame()
+col_data_hilic_neg <- colData(se_hilic_neg_main) %>% as.data.frame()
+
+create_overall_id <- function(cd) {
+    paste0(cd$event_name, "_", cd$proton_id, "_", cd$sample_id.x)
+}
+
+col_data_mf$overall_id <- create_overall_id(col_data_c8)
+col_data_c8$overall_id <- create_overall_id(col_data_c8)
+col_data_hilic_pos$overall_id <- create_overall_id(col_data_hilic_pos)
+col_data_hilic_neg$overall_id <- create_overall_id(col_data_hilic_neg)
+
+col_data_c8 <- col_data_c8 %>% 
+    left_join(col_data_mf, by = "overall_id")
+col_data_hilic_pos <- col_data_hilic_pos %>% 
+    left_join(col_data_mf, by = "overall_id")
+col_data_hilic_neg <- col_data_hilic_neg %>% 
+    left_join(col_data_mf, by = "overall_id")
+```
+
+Store `colData` in `SummarizedExperiment` objects.
+
+```{r}
+colData(se_c8_main) <- as(col_data_c8, "DataFrame")
+colData(se_hilic_pos_main) <- as(col_data_hilic_pos, "DataFrame")
+colData(se_hilic_neg_main) <- as(col_data_hilic_neg, "DataFrame")
+```
+
+
+
+# Metabolomics missing data explorations
+
+Investigate missingness by metabolite.
+
+```{r}
+missing_data_metab(se_c8_main)
+missing_data_metab(se_hilic_pos_main)
+missing_data_metab(se_hilic_neg_main)
+```
+
+Investigate missingness by sample. No samples are outliers in terms of missingness --> don't need to remove any samples for this reason.
+
+```{r}
+missing_data_samples(se_c8_main)
+missing_data_samples(se_hilic_pos_main)
+missing_data_samples(se_hilic_neg_main)
+```
+
+
+# Imputation of metabolomics data
+
+Evaluate different imputation methods on metabolomics data.
+
+```{r cache=TRUE}
+set.seed(95)
+eval_imp_c8 <- evaluate_imp_methods_metab(se_c8_main)
+
+set.seed(98)
+eval_imp_hilic_pos <- evaluate_imp_methods_metab(se_hilic_pos_main)
+
+set.seed(101)
+eval_imp_hilic_neg <- evaluate_imp_methods_metab(se_hilic_neg_main)
+```
+
+Compare imputation methods.
+
+```{r}
+imp_errors <- bind_rows(
+    list("C8" = eval_imp_c8$errors, "HILIC-pos" = eval_imp_hilic_pos$errors, "HILIC-neg" = eval_imp_hilic_pos$errors),
+    .id = "Injection"
+)
+```
+
+```{r}
+ggplot(imp_errors, aes(x = error, color = imp_method)) +
+    geom_density() +
+    facet_grid(. ~ Injection) +
+    theme_classic() +
+    labs(x = "Imputation error", color = "Imputation\nmethod")
+ggplot(imp_errors, aes(x = imp_method, color = imp_method, y = error)) +
+    geom_boxplot() +
+    facet_grid(. ~ Injection) +
+    theme_classic() +
+    labs(x = "Imputation method", y = "Imputation error") +
+    guides(color = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+Run imputation methods on original metabolomics data.
+
+```{r}
+set.seed(128)
+se_c8_main <- impute_metab(se_c8_main)
+se_hilic_pos_main <- impute_metab(se_hilic_pos_main)
+se_hilic_neg_main <- impute_metab(se_hilic_neg_main)
+```
+
+
+
+
+
+# RUV
+
+Pre-ruv explorations to choose k and negative controls. I use `which_log_abund = NULL` (amounting to imputing zeros for NAs) for these explorations instead of repeating these explorations for different imputed versions. Why?
+
+- Only the choice of k is affected by the choice of `which_log_abund`. (Choice of empirical standards is done on the original NA-filled abundance matrix.)
+    - Should be affected very little because there is almost no missing data for the chosen standards.
+
+```{r}
+idx_ctrls_c8 <- pre_ruv_explorations(se_c8_main)
+idx_ctrls_hilic_pos <- pre_ruv_explorations(se_hilic_pos_main)
+idx_ctrls_hilic_neg <- pre_ruv_explorations(se_hilic_neg_main)
+```
+
+```{r cache=TRUE}
+imp_methods <- c("imp_zero", "imp_half_min", "imp_qrilc")
+se_list <- list(c8 = se_c8_main, hilic_pos = se_hilic_pos_main, hilic_neg = se_hilic_neg_main)
+ctrls_list <- list(c8 = idx_ctrls_c8, hilic_pos = idx_ctrls_hilic_pos, hilic_neg = idx_ctrls_hilic_neg)
+
+set.seed(157)
+ruv_results <- lapply(imp_methods, function(imp_meth) {
+    lapply(names(se_list), function(injection) {
+        this_se <- se_list[[injection]]
+        this_ctrls <- ctrls_list[[injection]]
+        ruv_result <- implement_ruv(se = this_se, which_log_abund = imp_meth, idx_all_standards = this_ctrls, k = 3)
+    })
+})
+names(ruv_results) <- imp_methods
+```
+
+Look at plots and metrics to decide on best RUV-imputation combination.
+
+- It seems that **`QRILC`** imputation results in lower variance explained by the first few PCs, which likely indicates reduced presence of unwanted variation/batch effects.
+
+```{r fig.width=12}
+par(mfrow = c(3,2))
+for (imp_meth in imp_methods) {
+    ## Store RUV results (temporarily) in log_abund_ruv assay
+    assay(se_c8_main, "log_abund_ruv") <- t(ruv_results[[imp_meth]][[1]]$newY)
+    assay(se_hilic_pos_main, "log_abund_ruv") <- t(ruv_results[[imp_meth]][[2]]$newY)
+    assay(se_hilic_neg_main, "log_abund_ruv") <- t(ruv_results[[imp_meth]][[3]]$newY)
+    
+    ## Plot PCA output
+    plot_pc_info(
+        se_c8_main,
+        sample_descrip = paste("C8 - RUV:", imp_meth),
+        which_log_abund = "log_abund_ruv"
+    )
+    plot_pc_info(
+        se_hilic_pos_main,
+        sample_descrip = paste("HILIC-pos - RUV:", imp_meth),
+        which_log_abund = "log_abund_ruv"
+    )
+    plot_pc_info(
+        se_hilic_neg_main,
+        sample_descrip = paste("HILIC-neg - RUV:", imp_meth),
+        which_log_abund = "log_abund_ruv"
+    )
+}
+```
+
+Store QRILC-RUV results in `SummarizedExperiment` objects.
+
+```{r}
+# log_abund_ruv assay slot is no longer needed (was just a placeholder for visualizations above)
+assay(se_c8_main, "log_abund_ruv") <- NULL
+assay(se_hilic_pos_main, "log_abund_ruv") <- NULL
+assay(se_hilic_neg_main, "log_abund_ruv") <- NULL
+
+# Store QRILC-RUV results
+assay(se_c8_main, "log_abund_ruv_qrilc") <- t(ruv_results[["imp_qrilc"]][[1]]$newY)
+assay(se_hilic_pos_main, "log_abund_ruv_qrilc") <- t(ruv_results[["imp_qrilc"]][[2]]$newY)
+assay(se_hilic_neg_main, "log_abund_ruv_qrilc") <- t(ruv_results[["imp_qrilc"]][[3]]$newY)
+```
+
+
+
+
+
+# Save data
+
+```{r}
+save(se_c8_main, se_hilic_pos_main, se_hilic_neg_main, file = "../data/summ_exps_imputed_ruv.rda")
+```
+
+

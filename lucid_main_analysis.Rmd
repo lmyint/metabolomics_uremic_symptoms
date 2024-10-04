@@ -1,0 +1,1223 @@
+---
+title: "LUCID: Symptom analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+    
+```{r setup, include=FALSE}
+lib_paths <- .libPaths()
+lib_paths <- c("//win.ad.jhu.edu/Users$/HOME/R/win-library/4.0", lib_paths)
+.libPaths(lib_paths)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center")
+```
+
+# Notes
+
+- The `cv_disease` and `diabetes` variables represent history of **EVER** having a positive diagnosis.
+    - CV disease:
+        - US: CAD, cardiac arrest, cardiac arrhythmia, MI, stroke
+        - Canada: Same as US but not stroke
+        
+Order in which Rmd files must be run:
+
+1. `lucid_cleaning_qc.Rmd` / `fair_cleaning_qc.Rmd`
+2. `imputation_ruv.Rmd` / `fair_imputation_ruv.Rmd`
+3. `lucid_main_analysis.Rmd`
+
+
+
+
+
+# Load packages
+
+Load packages and utility functions.
+
+```{r message=FALSE}
+library(SummarizedExperiment)
+library(matrixStats)
+library(readxl)
+library(tidyverse)
+library(ggthemes)
+library(lubridate)
+library(limma)
+library(splines)
+library(caret)
+library(glmnet)
+library(randomForest)
+
+source("functions_utils.R")
+source("functions_limma_analysis.R")
+source("functions_ml.R")
+```
+
+# Metabolite counting
+
+Load data where original number of metabolites can be counted
+
+```{r}
+load("../data/summ_exps_clean_pre_filter.rda")
+load("../data/summ_exps_fair_clean_pre_filter.rda")
+```
+
+Remove internal standards
+
+```{r}
+# LUCID
+se_c8_main <- remove_internal_standards(se_c8_main)
+se_hilic_pos_main <- remove_internal_standards(se_hilic_pos_main)
+se_hilic_neg_main <- remove_internal_standards(se_hilic_neg_main)
+
+# FAIR
+se_c8_fair_main <- remove_internal_standards(se_c8_fair_main)
+se_hilic_pos_fair_main <- remove_internal_standards(se_hilic_pos_fair_main)
+se_hilic_neg_fair_main <- remove_internal_standards(se_hilic_neg_fair_main)
+```
+
+```{r}
+rd_lucid <- bind_rows(
+    rowData(se_c8_main) %>% as.data.frame() %>% mutate(hmdb_id_certainty = as.character(hmdb_id_certainty)),
+    rowData(se_hilic_pos_main) %>% as.data.frame() %>% mutate(hmdb_id_certainty = as.character(hmdb_id_certainty)),
+    rowData(se_hilic_neg_main) %>% as.data.frame() %>% mutate(hmdb_id_certainty = as.character(hmdb_id_certainty))
+)
+rd_fair <- bind_rows(
+    rowData(se_c8_fair_main) %>% as.data.frame(),
+    rowData(se_hilic_pos_fair_main) %>% as.data.frame(),
+    rowData(se_hilic_neg_fair_main) %>% as.data.frame()
+)
+```
+
+Get unique known metabolites across LUCID and FAIR.
+
+```{r}
+setdiff(c(rd_lucid$hmdb_id, rd_fair$hmdb_id), NA) %>% length()
+```
+
+Get unknowns.
+
+```{r}
+unknowns_lucid <- rd_lucid %>%
+    filter(is.na(hmdb_id)) %>% 
+    select(method, mz, rt)
+unknowns_fair <- rd_fair %>%
+    filter(is.na(hmdb_id)) %>% 
+    select(method, mz, rt)
+unknowns <- bind_rows(unknowns_lucid, unknowns_fair)
+dim(unknowns)
+dim(unique(unknowns))
+
+round_any <- function(x, accuracy, f = round) {
+    f(x/accuracy)*accuracy
+}
+
+unknowns <- unknowns %>% 
+    mutate(mz = round_any(mz, .05), rt = round_any(rt, 0.25))
+dim(unique(unknowns))
+```
+
+Remove this data to avoid conflicts with loading in clean data.
+
+```{r}
+rm(se_c8_main, se_hilic_pos_main, se_hilic_neg_main)
+rm(se_c8_fair_main, se_hilic_pos_fair_main, se_hilic_neg_fair_main)
+```
+
+
+
+
+# Load clean data for analyses
+
+```{r}
+load("../data/summ_exps_imputed_ruv.rda")
+load("../data/summ_exps_fair_imputed_ruv.rda")
+```
+
+
+
+
+
+# Data cleaning
+
+## Remove internal standards
+
+LUCID
+
+```{r}
+se_c8_main <- remove_internal_standards(se_c8_main)
+se_hilic_pos_main <- remove_internal_standards(se_hilic_pos_main)
+se_hilic_neg_main <- remove_internal_standards(se_hilic_neg_main)
+```
+
+FAIR
+
+```{r}
+se_c8_fair_main <- remove_internal_standards(se_c8_fair_main)
+se_hilic_pos_fair_main <- remove_internal_standards(se_hilic_pos_fair_main)
+se_hilic_neg_fair_main <- remove_internal_standards(se_hilic_neg_fair_main)
+```
+
+## Update `site` variable
+
+```{r}
+se_c8_main <- update_site_variable(se_c8_main)
+se_hilic_pos_main <- update_site_variable(se_hilic_pos_main)
+se_hilic_neg_main <- update_site_variable(se_hilic_neg_main)
+```
+
+## Add `former_nomenclature` column to HILIC+ in FAIR
+
+```{r}
+rowData(se_hilic_pos_fair_main)$former_nomenclature <- NA
+```
+
+## Check overlaps in HMDB IDs across LUCID and FAIR
+
+```{r}
+check_lucid_fair_overlap <- function(se_lucid, se_fair) {
+    ids_lucid <- setdiff(rowData(se_lucid)$hmdb_id, NA)
+    ids_fair <- setdiff(rowData(se_fair)$hmdb_id, NA)
+    ov <- intersect(ids_lucid, ids_fair)
+    cat("Unique HMDB IDs in LUCID:", length(ids_lucid), "\n")
+    cat("Unique HMDB IDs in FAIR:", length(ids_fair), "\n")
+    cat("# in common:", length(ov), "\n")
+}
+check_lucid_fair_overlap(se_c8_main, se_c8_fair_main)
+check_lucid_fair_overlap(se_hilic_pos_main, se_hilic_pos_fair_main)
+check_lucid_fair_overlap(se_hilic_neg_main, se_hilic_neg_fair_main)
+```
+
+## Relabel QI04755 in FAIR
+
+```{r}
+rowData(se_c8_fair_main) %>%
+    as.data.frame() %>% 
+    filter(str_detect(compound_id, "04755"))
+
+rowData(se_hilic_pos_fair_main) %>%
+    as.data.frame() %>% 
+    filter(str_detect(compound_id, "04755"))
+
+rowData(se_hilic_neg_fair_main) %>%
+    as.data.frame() %>% 
+    filter(str_detect(compound_id, "04755"))
+
+rowData(se_hilic_neg_main) %>%
+    as.data.frame() %>% 
+    filter(str_detect(metabolite, "2-hydroxy-3-methylpentanoate"))
+```
+
+```{r}
+index_lucid <- which(str_detect(rowData(se_hilic_neg_main)$metabolite, "2-hydroxy-3-methylpentanoate"))
+index_fair <- which(str_detect(rowData(se_hilic_neg_fair_main)$compound_id, "04755"))
+
+rowData(se_hilic_neg_fair_main)$hmdb_id[index_fair] <- rowData(se_hilic_neg_main)$hmdb_id[index_lucid]
+rowData(se_hilic_neg_fair_main)$metabolite[index_fair] <- rowData(se_hilic_neg_main)$metabolite[index_lucid]
+
+rowData(se_hilic_neg_fair_main) %>%
+    as.data.frame() %>% 
+    filter(str_detect(compound_id, "04755"))
+```
+
+
+
+
+# Summary statistics across covariates
+
+LUCID
+
+```{r}
+cd <- colData(se_c8_main) %>%
+    as.data.frame() %>%
+    filter(event_name=="Baseline")
+cd_year1 <- colData(se_c8_main) %>%
+    as.data.frame() %>%
+    filter(event_name=="Year 1")
+
+# Subset to analytic sample
+# mod_form <- ~symptom+ns(age,df=3)+gender+ns(height,df=3)+ns(dry_weight,df=3)+cv_disease+diabetes+country
+
+bool_cc_baseline <- complete.cases(cd[,c("age", "gender", "height", "dry_weight", "cv_disease", "diabetes", "country")])
+table(bool_cc_baseline)
+cd_baseline_analytic <- cd[bool_cc_baseline,]
+
+bool_cc_year1 <- complete.cases(cd_year1[,c("age", "gender", "height", "dry_weight", "cv_disease", "diabetes", "country")])
+bool_any_symptom_year1 <- rowSums(is.na(cd_year1[,c("fatigue", "pruritus", "anorexia", "nausea_vomiting", "daytime_sleepiness", "difficulty_concentrating", "bodily_pain")])) < 7
+table(bool_cc_year1)
+cd_year1_analytic <- cd_year1[bool_cc_year1,]
+
+show_summary_stats <- function(coldat) {
+    variables <- c("age", "gender", "race", "height", "dry_weight", "bmi", "cad", "cardiac_arrest", "cardiac_arrhythmias", "mi", "stroke", "cv_disease", "diabetes", "alb", "hgb", "ferritin", "phosph", "ipth")
+    variable_types <- c("q", "c", "c", rep("q", 3), rep("c", 7), rep("q", 5))
+    
+    for (i in seq_along(variables)) {
+        var <- variables[i]
+        cat(var, "-------------------------------------------:\n")
+        if (variable_types[i]=="c") {
+            coldat %>% count(.data[[var]]) %>% mutate(frac = n/sum(n)) %>% print()
+            coldat %>% count(country, .data[[var]]) %>% print()
+        } else {
+            print(summary(coldat[[var]]))
+        }
+    }
+}
+
+show_summary_stats(cd_baseline_analytic)
+show_summary_stats(cd_year1_analytic)
+
+symptoms <- c("fatigue", "pruritus", "anorexia", "nausea_vomiting", "daytime_sleepiness", "difficulty_concentrating", "bodily_pain")
+
+for (event in c("Baseline", "Year 1")) {
+    if (event=="Baseline") {
+        cd <- cd_baseline_analytic
+    } else if (event=="Year 1") {
+        cd <- cd_year1_analytic
+    }
+    cat("*****", event, "*****\n")
+    for (i in seq_along(symptoms)) {
+        symp <- symptoms[i]
+        n_this_symp <- sum(!is.na(cd[[symp]]))
+        n_na_this_symp <- sum(is.na(cd[[symp]]))
+        n_na_this_symp_us <- sum(is.na(cd[[symp]]) & cd$country=="US")
+        n_na_this_symp_can <- sum(is.na(cd[[symp]]) & cd$country=="Canada")
+        num_symptomatic <- sum(cd[[symp]]!="grade1", na.rm = TRUE)
+        cat(symp, "-------------------------------------------:\n")
+        cat("# with missing responses:", n_na_this_symp, "(US:", n_na_this_symp_us, ", Canada:", n_na_this_symp_can, ")\n")
+        cat("Total non-missing responses:", n_this_symp, "\n")
+        cat("# symptomatic:", num_symptomatic, "\n")
+        cat("Frac symptomatic:", num_symptomatic/n_this_symp, "\n")
+    }
+    
+    cat("# missing all symptoms:\n")
+    tab1 <- table(rowSums(is.na(cd[,symptoms]))==7, useNA = "ifany")
+    print(tab1)
+    print(prop.table(tab1))
+    tab1_by_country <- table(rowSums(is.na(cd[,symptoms]))==7, cd$country, useNA = "ifany")
+    print(tab1_by_country)
+    cat("# symptomatic for any symptom:\n")
+    tab2 <- table(rowSums(cd[,symptoms]!="grade1", na.rm = TRUE) > 0, useNA = "ifany")
+    print(tab2)
+    print(prop.table(tab2))
+}
+```
+
+FAIR
+
+```{r}
+cd_fair <- colData(se_c8_fair_main) %>% as.data.frame()
+
+# Subset to analytic sample
+# mod_form <- ~symptom+ns(age,df=3)+sex+ns(ht_cm,df=3)+ns(wt_kg,df=3)+cv_disease+diabetes
+
+bool_cc_fair <- complete.cases(cd_fair[,c("age", "sex", "ht_cm", "wt_kg", "cv_disease", "diabetes")])
+cd_fair_analytic <- cd_fair[bool_cc_fair,]
+
+
+variables <- c("age", "sex", "race_eth", "ht_cm", "wt_kg", "bmi", "mi", "pvd" , "cvd", "chf", "cv_disease", "diabetes", "alb", "hgb", "ferritin", "phosph", "ipth")
+variable_types <- c("q", "c", "c", rep("q", 3), rep("c", 6), rep("q", 5))
+
+for (i in seq_along(variables)) {
+    var <- variables[i]
+    cat(var, "-------------------------------------------:\n")
+    if (variable_types[i]=="c") {
+        cd_fair_analytic %>% count(.data[[var]]) %>% mutate(frac = n/sum(n)) %>% print()
+    } else {
+        print(summary(cd_fair_analytic[[var]]))
+    }
+}
+
+for (i in seq_along(symptoms)) {
+    symp <- symptoms[i]
+    n_this_symp <- sum(!is.na(cd_fair_analytic[[symp]]))
+    num_symptomatic <- sum(cd_fair_analytic[[symp]]!="grade1", na.rm = TRUE)
+    cat(symp, "-------------------------------------------:\n")
+    cat("Total non-missing responses:", n_this_symp, "\n")
+    cat("# symptomatic:", num_symptomatic, "\n")
+    cat("Frac symptomatic:", num_symptomatic/n_this_symp, "\n")
+}
+
+cat("# missing all symptoms:\n")
+tab1 <- table(rowSums(is.na(cd_fair_analytic[,symptoms]))==7, useNA = "ifany")
+print(tab1)
+print(prop.table(tab1))
+cat("# symptomatic for any symptom:\n")
+tab2 <- table(rowSums(cd_fair_analytic[,symptoms]!="grade1", na.rm = TRUE) > 0, useNA = "ifany")
+print(tab2)
+print(prop.table(tab2))
+```
+
+
+
+
+
+# Check missing data and sample sizes
+
+```{r}
+se_list <- list(
+    c8 = se_c8_main,
+    hilic_pos = se_hilic_pos_main,
+    hilic_neg = se_hilic_neg_main
+)
+se_all <- merge_ses_across_injections(se_list)
+rd <- rowData(se_all)
+sum(!is.na(rd$metabolite))
+cd <- colData(se_all)
+```
+
+```{r}
+cols <- c("proton_id", "studynum", "event_name", "age", "gender", "height", "dry_weight", "cv_disease", "diabetes", "country")
+cd_subs <- cd[,cols] %>%
+    as.data.frame() %>% 
+    mutate(id = if_else(country=="Canada", studynum, proton_id)) %>% 
+    select(-proton_id, -studynum)
+cd_baseline <- cd_subs %>% filter(event_name=="Baseline") %>% select(-event_name)
+cd_year1 <- cd_subs %>% filter(event_name=="Year 1") %>% select(-event_name)
+colnames(cd_baseline) <- str_c(colnames(cd_baseline), "_b")
+cd_baseline <- cd_baseline %>% rename(id = id_b)
+colnames(cd_year1) <- str_c(colnames(cd_year1), "_y1")
+cd_year1 <- cd_year1 %>% rename(id = id_y1)
+
+sum(complete.cases(cd_baseline))
+sum(complete.cases(cd_year1))
+
+summary(cd_baseline)
+summary(cd_year1)
+
+cd_year1_baseline <- left_join(cd_year1, cd_baseline, by = "id")
+```
+
+
+
+
+
+# Total number of metabolites across LUCID and FAIR
+
+```{r}
+se_list <- list(
+    c8 = se_c8_main,
+    hilic_pos = se_hilic_pos_main,
+    hilic_neg = se_hilic_neg_main
+)
+
+se_list_fair <- list(
+    c8 = se_c8_fair_main,
+    hilic_pos = se_hilic_pos_fair_main,
+    hilic_neg = se_hilic_neg_fair_main
+)
+
+se_all_lucid <- merge_ses_across_injections(se_list)
+se_all_fair <- merge_ses_across_injections(se_list_fair)
+
+rd_lucid <- rowData(se_all_lucid) %>% as.data.frame()
+rd_fair <- rowData(se_all_fair) %>% as.data.frame()
+
+setdiff(c(rd_lucid$hmdb_id, rd_fair$hmdb_id), NA) %>% length()
+```
+
+```{r}
+unknowns_lucid <- rd_lucid %>%
+    filter(is.na(hmdb_id)) %>% 
+    select(method, mz, rt)
+unknowns_fair <- rd_fair %>%
+    filter(is.na(hmdb_id)) %>% 
+    select(method, mz, rt)
+unknowns <- bind_rows(unknowns_lucid, unknowns_fair)
+dim(unknowns)
+dim(unique(unknowns))
+
+unknowns <- unknowns %>% 
+    mutate(mz = round_any(mz, .05), rt = round_any(rt, 0.25))
+dim(unique(unknowns))
+```
+
+
+
+
+
+# Fit ordinary regression models
+
+## LUCID
+
+Set up sensitivity analysis specifications.
+
+```{r}
+df_analysis_versions <- tidyr::crossing(
+    metab_type = c("orig", "qrilc_no_ruv", "qrilc_ruv"),
+    imputed_symptoms = c(FALSE, TRUE)
+)
+df_analysis_versions <- df_analysis_versions %>%
+    mutate(
+        version = paste0("v", seq_len(nrow(df_analysis_versions)))
+    )
+```
+
+Run analyses across sensitivity analysis specifications.
+
+```{r}
+linreg_results <- vector("list", nrow(df_analysis_versions))
+
+mod_form <- symptom ~ metab+ns(age,df=3)+gender+ns(height,df=3)+ns(dry_weight,df=3)+cv_disease+diabetes+country
+
+for (i in seq_len(nrow(df_analysis_versions))) {
+    linreg_results[[i]] <- run_all_linreg_analyses(
+        se_list = se_list,
+        mod_form = mod_form,
+        cohort = "LUCID",
+        metab_type = df_analysis_versions$metab_type[i],
+        use_imputed_symptoms = df_analysis_versions$imputed_symptoms[i]
+    )
+}
+
+linreg_results_lucid_df_list <- lapply(linreg_results, results_list_to_df)
+names(linreg_results_lucid_df_list) <- df_analysis_versions$version
+df_linreg_results_lucid <- bind_rows(linreg_results_lucid_df_list, .id = "version") %>%
+    mutate(cohort = "LUCID") %>%
+    left_join(df_analysis_versions, by = "version")
+```
+
+## FAIR
+
+Set up axes of sensitivity analysis for FAIR.
+
+```{r}
+df_analysis_versions <- tidyr::crossing(
+    metab_type = c("orig", "qrilc_no_ruv", "qrilc_ruv")
+)
+df_analysis_versions <- df_analysis_versions %>%
+    mutate(
+        version = paste0("v", seq_len(nrow(df_analysis_versions)))
+    )
+```
+
+Run analyses across sensitivity analysis specifications.
+
+```{r}
+linreg_results_fair <- vector("list", nrow(df_analysis_versions))
+
+mod_form <- symptom ~ metab+ns(age,df=3)+sex+ns(ht_cm,df=3)+ns(wt_kg,df=3)+cv_disease+diabetes
+
+for (i in seq_len(nrow(df_analysis_versions))) {
+    linreg_results_fair[[i]] <- run_all_linreg_analyses(
+        se_list = se_list_fair,
+        mod_form = mod_form,
+        cohort = "FAIR",
+        metab_type = df_analysis_versions$metab_type[i],
+        use_imputed_symptoms = FALSE
+    )
+}
+
+linreg_results_fair_df_list <- lapply(linreg_results_fair, results_list_to_df)
+names(linreg_results_fair_df_list) <- df_analysis_versions$version
+df_linreg_results_fair <- bind_rows(linreg_results_fair_df_list, .id = "version") %>%
+    mutate(cohort = "FAIR") %>%
+    left_join(df_analysis_versions, by = "version")
+
+## Change "HILIC" to "HIL" in `method` variable
+df_linreg_results_fair <- df_linreg_results_fair %>%
+    mutate(method = str_replace(method, "HILIC", "HIL"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+# Fit limma models
+
+## LUCID
+
+Set up axes of sensitivity analyses.
+
+- Removed "race" and "ethnicity" for now due to problems estimating those coefficients (just some of the race coefficients actually, but removing ethnicity due to removing race)
+
+**REVISIT:** Problems when adjusting for site. `Coefficients not estimable: siteSeattle`
+
+"age", "gender", "race", "height", "dry_weight", "bmi", "cad", "cardiac_arrest", "cardiac_arrhythmias", "mi", "stroke", "diabetes", "alb", "hgb", "ferritin", "phosph", "ipth"
+
+```{r}
+# mod_forms <- c(
+#     ~symptom+ns(age,df=3)+gender+ns(height,df=3)+ns(dry_weight,df=3)+cv_disease+diabetes,
+#     ~symptom+ns(age,df=3)+gender+ns(height,df=3)+ns(dry_weight,df=3)+cv_disease+diabetes+ns(alb_imp,df=3)+ns(hgb_imp,df=3)+ns(ferritin_imp,df=3)+ns(phosph_imp,df=3)+ns(ipth_imp,df=3)
+# )
+
+df_analysis_versions <- tidyr::crossing(
+    # mod_form = mod_forms,
+    metab_type = c("orig", "qrilc_no_ruv", "qrilc_ruv"),
+    imputed_symptoms = c(FALSE, TRUE)
+)
+df_analysis_versions <- df_analysis_versions %>%
+    mutate(
+        version = paste0("v", seq_len(nrow(df_analysis_versions)))
+    )
+```
+
+Run limma analyses across sensitivity analysis specifications.
+
+```{r}
+se_list <- list(
+    c8 = se_c8_main,
+    hilic_pos = se_hilic_pos_main,
+    hilic_neg = se_hilic_neg_main
+)
+
+limma_results <- vector("list", nrow(df_analysis_versions))
+
+mod_form <- ~symptom+ns(age,df=3)+gender+ns(height,df=3)+ns(dry_weight,df=3)+cv_disease+diabetes+country
+
+for (i in seq_len(nrow(df_analysis_versions))) {
+    limma_results[[i]] <- run_all_analyses(
+        se_list = se_list,
+        mod_form = mod_form,
+        cohort = "LUCID",
+        coarse_symptom_levels = 3,
+        metab_type = df_analysis_versions$metab_type[i],
+        use_imputed_symptoms = df_analysis_versions$imputed_symptoms[i]
+    )
+}
+
+limma_results_lucid_df_list <- lapply(limma_results, results_list_to_df)
+names(limma_results_lucid_df_list) <- df_analysis_versions$version
+df_limma_results_lucid <- bind_rows(limma_results_lucid_df_list, .id = "version") %>%
+    mutate(cohort = "LUCID") %>%
+    left_join(df_analysis_versions, by = "version")
+```
+
+## FAIR
+
+Set up axes of sensitivity analysis for FAIR.
+
+```{r}
+df_analysis_versions <- tidyr::crossing(
+    metab_type = c("orig", "qrilc_no_ruv", "qrilc_ruv")
+)
+df_analysis_versions <- df_analysis_versions %>%
+    mutate(
+        version = paste0("v", seq_len(nrow(df_analysis_versions)))
+    )
+```
+
+Run limma analyses across sensitivity analysis specifications.
+
+```{r}
+se_list_fair <- list(
+    c8 = se_c8_fair_main,
+    hilic_pos = se_hilic_pos_fair_main,
+    hilic_neg = se_hilic_neg_fair_main
+)
+
+limma_results_fair <- vector("list", nrow(df_analysis_versions))
+
+mod_form <- ~symptom+ns(age,df=3)+sex+ns(ht_cm,df=3)+ns(wt_kg,df=3)+cv_disease+diabetes
+
+for (i in seq_len(nrow(df_analysis_versions))) {
+    limma_results_fair[[i]] <- run_all_analyses(
+        se_list = se_list_fair,
+        mod_form = mod_form,
+        cohort = "FAIR",
+        coarse_symptom_levels = 3,
+        metab_type = df_analysis_versions$metab_type[i],
+        use_imputed_symptoms = FALSE
+    )
+}
+
+limma_results_fair_df_list <- lapply(limma_results_fair, results_list_to_df)
+names(limma_results_fair_df_list) <- df_analysis_versions$version
+df_limma_results_fair <- bind_rows(limma_results_fair_df_list, .id = "version") %>%
+    mutate(cohort = "FAIR") %>%
+    left_join(df_analysis_versions, by = "version")
+
+## Change "HILIC" to "HIL" in `method` variable
+df_limma_results_fair <- df_limma_results_fair %>%
+    mutate(method = str_replace(method, "HILIC", "HIL"))
+```
+
+
+
+
+
+# Fit ML models
+
+## LUCID
+
+```{r}
+adj_vars <- c("age", "gender", "height", "dry_weight", "cv_disease", "diabetes", "country") # "race", "alb", "hgb", "ferritin", "phosph", "ipth"
+
+df_analysis_versions <- tidyr::crossing(
+    metab_type = c("qrilc_no_ruv", "qrilc_ruv"),
+    imputed_symptoms = c(FALSE, TRUE)
+)
+df_analysis_versions <- df_analysis_versions %>%
+    mutate(
+        version = paste0("v", seq_len(nrow(df_analysis_versions)))
+    )
+
+set.seed(248)
+ml_results_lucid <- lapply(seq_len(nrow(df_analysis_versions)), function(i) {
+    run_all_ml_analyses(
+        se_list = se_list,
+        adjustment_vars = adj_vars,
+        cohort = "LUCID",
+        only_known_metabs = TRUE,
+        coarse_symptom_levels = 3,
+        metab_type = df_analysis_versions$metab_type[i],
+        use_imputed_symptoms = df_analysis_versions$imputed_symptoms[i]
+    )
+})
+
+ml_results_lucid_df_list  <- lapply(ml_results_lucid, ml_results_to_df)
+names(ml_results_lucid_df_list) <- df_analysis_versions$version
+df_ml_results_lucid <- bind_rows(ml_results_lucid_df_list, .id = "version") %>%
+    mutate(cohort = "LUCID") %>%
+    left_join(df_analysis_versions, by = "version") %>%
+    filter(!(metab_id %in% adj_vars))
+```
+
+Plots of test accuracy vs. tuning parameters
+
+```{r}
+par(mfrow = c(1,2))
+for (i in seq_along(ml_results_lucid)) {
+    list_this_sens_version <- ml_results_lucid[[i]]
+    for (event in names(list_this_sens_version)) {
+        list_this_event <- list_this_sens_version[[event]]
+        for (symp in names(list_this_event)) {
+            list_this_symptom <- list_this_event[[symp]]
+            plot(list_this_symptom[[1]], main = paste0("Version ", i, ". Event: ", event, ". Symptom: ", symp))
+            plot(list_this_symptom[[2]], main = paste0("Version ", i, ". Event: ", event, ". Symptom: ", symp))
+        }
+    }
+}
+```
+
+
+## FAIR
+
+```{r}
+adj_vars <- c("age", "sex", "ht_cm", "wt_kg", "cv_disease", "diabetes")
+metab_types <- c("qrilc_no_ruv", "qrilc_ruv")
+
+set.seed(282)
+ml_results_fair <- lapply(metab_types, function(metab_type) {
+    run_all_ml_analyses(
+        se_list = se_list_fair,
+        adjustment_vars = adj_vars,
+        cohort = "FAIR",
+        only_known_metabs = TRUE,
+        coarse_symptom_levels = 3,
+        metab_type = metab_type,
+        use_imputed_symptoms = FALSE
+    )
+})
+
+ml_results_fair_df_list  <- lapply(ml_results_fair, ml_results_to_df)
+names(ml_results_fair_df_list) <- metab_types
+df_ml_results_fair <- bind_rows(ml_results_fair_df_list, .id = "metab_type") %>%
+    mutate(cohort = "FAIR") %>%
+    filter(!(metab_id %in% adj_vars))
+```
+
+Save results.
+
+```{r}
+save(df_linreg_results_lucid, df_linreg_results_fair, df_limma_results_lucid, df_limma_results_fair, df_ml_results_lucid, df_ml_results_fair, file = "../data/symptoms_results_df.rda")
+```
+
+
+
+
+
+# Look at QI04755
+
+```{r}
+df_linreg_results_fair %>% filter(compound_id=="QI04755")
+df_limma_results_fair %>% filter(compound_id=="QI04755")
+```
+
+```{r}
+df_linreg_results_fair %>% filter(compound_id=="QI04755") %>% arrange(p.value)
+df_limma_results_fair %>% filter(compound_id=="QI04755") %>% arrange(P.Value)
+```
+
+# Plots and tables
+
+For "interesting" metabolites, want to know:
+
+- `limma` results: Significant association?
+    - At baseline? At Year 1? In FAIR?
+- ML results: At least medium importance in LASSO? In RF?
+    - At baseline? At Year 1? In FAIR?
+
+```{r}
+summarize_results <- function(met_type, imp_symptoms, df_limma_lucid, df_limma_fair, df_ml_lucid, df_ml_fair, signif_only = TRUE) {
+    df_limma_lucid <- df_limma_lucid %>%
+        filter(metab_type==met_type, imputed_symptoms==imp_symptoms)
+    df_limma_fair <- df_limma_fair %>%
+        filter(metab_type==met_type)
+    df_ml_lucid <- df_ml_lucid %>%
+        filter(metab_type==met_type, imputed_symptoms==imp_symptoms) %>%
+        left_join(unique(select(df_limma_lucid, metab_id, hmdb_id)), by = "metab_id")
+    df_ml_fair <- df_ml_fair %>%
+        filter(metab_type==met_type) %>%
+        left_join(unique(select(df_limma_fair, metab_id, hmdb_id)), by = "metab_id")
+    
+    signif_combos_nonml <- lapply(list(df_limma_lucid, df_limma_fair), function(df) {
+        df %>%
+            filter(adj_pval < 0.1, !is.na(metabolite), !is.na(hmdb_id), hmdb_id!="NA") %>%
+            select(symptom, hmdb_id)
+    })
+    signif_combos_nonml <- bind_rows(signif_combos_nonml)
+    signif_combos_ml_lucid <- df_ml_lucid %>%
+        mutate(
+            is_imp_baseline = (importance_lasso_Baseline %in% c("High")) & (importance_rf_Baseline %in% c("High")),
+            is_imp_year1 = (`importance_lasso_Year 1` %in% c("High")) & (`importance_rf_Year 1` %in% c("High"))
+        ) %>%
+        filter(is_imp_baseline | is_imp_year1) %>%
+        select(symptom, hmdb_id)
+    signif_combos_ml_fair <- df_ml_fair %>%
+        filter(
+            importance_lasso_FAIR %in% c("High"),
+            importance_rf_FAIR %in% c("High")
+        ) %>%
+        select(symptom, hmdb_id)
+    signif_combos <- bind_rows(signif_combos_nonml) %>% unique() %>% drop_na()
+    if (!signif_only) {
+        signif_combos <- df_limma_lucid %>%
+            select(symptom, hmdb_id) %>%
+            unique() %>%
+            drop_na() %>%
+            filter(hmdb_id != "NA")
+    }
+    
+    ## Get all columns of relevant information
+    limma_lucid_signif <- df_limma_lucid %>%
+        semi_join(signif_combos, by = c("symptom", "hmdb_id")) %>%
+        select(method, event, symptom, hmdb_id, metabolite, mz, rt, symptomlevel2, symptomlevel3, P.Value, adj_pval) %>%
+        pivot_wider(names_from = event, values_from = c(symptomlevel2, symptomlevel3, P.Value, adj_pval))
+    
+    limma_fair_signif <- df_limma_fair %>%
+        semi_join(signif_combos, by = c("symptom", "hmdb_id")) %>%
+        select(method, symptom, hmdb_id, metabolite, mz, rt, former_nomenclature, symptomlevel2_FAIR = symptomlevel2, symptomlevel3_FAIR = symptomlevel3, P.Value_FAIR = P.Value, adj_pval_FAIR = adj_pval)
+    
+    ## Merge in FAIR
+    res <- limma_lucid_signif %>%
+        left_join(limma_fair_signif, by = c("method", "symptom", "hmdb_id"), suffix = c("_lucid", "_fair"))
+    
+    ## Clean up presentation
+    res <- res %>%
+        mutate(across(starts_with("symptomlevel"), function(x) {round(2^x, 2)})) %>%
+        mutate(across(contains("adj_pval"), function(x) {ifelse(x < 0.1, paste("(S)", x), paste("", x))})) %>%
+        arrange(symptom, adj_pval_Baseline) %>%
+        left_join(df_ml_lucid, by = c("symptom", "metabolite_lucid" = "metab_id")) %>%
+        left_join(df_ml_fair, by = c("symptom", "metabolite_fair" = "metab_id")) %>%
+        select(method, symptom, hmdb_id, former_nomenclature, mz_lucid, rt_lucid, starts_with("metabolite_"), contains("Baseline"), contains("Year 1"), contains("FAIR"))
+
+    res
+}
+```
+
+```{r}
+res_ruv <- summarize_results(
+    met_type = "qrilc_ruv",
+    imp_symptoms = TRUE,
+    df_limma_lucid = df_limma_results_lucid,
+    df_limma_fair = df_limma_results_fair,
+    df_ml_lucid = df_ml_results_lucid,
+    df_ml_fair = df_ml_results_fair,
+    signif_only = TRUE
+)
+
+res_no_ruv <- summarize_results(
+    met_type = "qrilc_no_ruv",
+    imp_symptoms = TRUE,
+    df_limma_lucid = df_limma_results_lucid,
+    df_limma_fair = df_limma_results_fair,
+    df_ml_lucid = df_ml_results_lucid,
+    df_ml_fair = df_ml_results_fair,
+    signif_only = TRUE
+)
+
+res_ruv_no_imp_symp <- summarize_results(
+    met_type = "qrilc_ruv",
+    imp_symptoms = FALSE,
+    df_limma_lucid = df_limma_results_lucid,
+    df_limma_fair = df_limma_results_fair,
+    df_ml_lucid = df_ml_results_lucid,
+    df_ml_fair = df_ml_results_fair,
+    signif_only = TRUE
+)
+
+res_no_ruv_no_imp_symp <- summarize_results(
+    met_type = "qrilc_no_ruv",
+    imp_symptoms = FALSE,
+    df_limma_lucid = df_limma_results_lucid,
+    df_limma_fair = df_limma_results_fair,
+    df_ml_lucid = df_ml_results_lucid,
+    df_ml_fair = df_ml_results_fair,
+    signif_only = TRUE
+)
+
+res_ruv <- unique(res_ruv) %>% mutate(analysis_version = "ruv_yes_imp_yes")
+res_no_ruv <- unique(res_no_ruv) %>% mutate(analysis_version = "ruv_no_imp_yes")
+res_ruv_no_imp_symp <- unique(res_ruv_no_imp_symp) %>% mutate(analysis_version = "ruv_yes_imp_no")
+res_no_ruv_no_imp_symp <- unique(res_no_ruv_no_imp_symp) %>% mutate(analysis_version = "ruv_no_imp_no")
+```
+
+Store results from all sensitivity analyses.
+
+```{r}
+df_analysis_versions <- crossing(
+    met_type = c("qrilc_no_ruv", "qrilc_ruv"),
+    imp_symptoms = c(TRUE, FALSE)
+) %>% 
+    mutate(analysis_version = c("ruv_no_imp_no", "ruv_no_imp_yes", "ruv_yes_imp_no", "ruv_yes_imp_yes"))
+
+df_results_all_versions <- lapply(seq_len(nrow(df_analysis_versions)), function(r) {
+    met_type <- df_analysis_versions$met_type[r]
+    imp_symptoms <- df_analysis_versions$imp_symptoms[r]
+    res <- summarize_results(
+        met_type = met_type,
+        imp_symptoms = imp_symptoms,
+        df_limma_lucid = df_limma_results_lucid,
+        df_limma_fair = df_limma_results_fair,
+        df_ml_lucid = df_ml_results_lucid,
+        df_ml_fair = df_ml_results_fair,
+        signif_only = FALSE
+    )
+    res <- res %>%
+        unique() %>%
+        mutate(analysis_version = df_analysis_versions$analysis_version[r])
+}) %>% bind_rows() %>% unique()
+```
+
+```{r}
+se_all_lucid <- merge_ses_across_injections(se_list)
+se_all_fair <- merge_ses_across_injections(se_list_fair)
+
+"HMDB0000317" %in% rowData(se_all_fair)$hmdb_id
+```
+
+Plots of symptom grade versus metabolite abundance.
+
+```{r}
+hmdb_ids_interest <- res_ruv %>%
+    filter(!str_detect(metabolite_lucid, "acetaminophen")) %>%
+    pull(hmdb_id) %>%
+    unique()
+
+rd <- rowData(se_all_lucid)
+bool_metabs <- rd$hmdb_id %in% hmdb_ids_interest
+cd <- colData(se_all_lucid)
+bool_samples <- cd$event_name=="Year 1"
+
+se_all_lucid_subs <- se_all_lucid[bool_metabs, bool_samples]
+se_all_lucid_subs <- se_all_lucid_subs[!duplicated(rowData(se_all_lucid_subs)$hmdb_id),]
+df_interest <- assay(se_all_lucid_subs, "log_abund") %>% t() %>% as.data.frame()
+colnames(df_interest) <- rowData(se_all_lucid_subs)$hmdb_id
+
+df_metab_names <- rowData(se_all_fair)[rowData(se_all_fair)$hmdb_id %in% hmdb_ids_interest, c("hmdb_id", "metabolite")] %>% as.data.frame() %>% unique()
+new_colnames <- tibble(hmdb_id = colnames(df_interest)) %>%
+    left_join(df_metab_names, by = "hmdb_id") %>%
+    mutate(metabolite = ifelse(is.na(metabolite), "2-hydroxy-3-methylpentanoate", metabolite)) %>%
+    pull(metabolite)
+
+colnames(df_interest) <- new_colnames
+
+symptom_names <- get_symptom_definitions()$short_descrip
+df_interest <- bind_cols(as.data.frame(colData(se_all_lucid_subs)[,symptom_names]), df_interest)
+df_interest <- pivot_longer(df_interest, cols = fatigue:bodily_pain, names_to = "symptom", values_to = "severity") %>%
+    pivot_longer(cols = -c(symptom, severity), names_to = "metabolite", values_to = "abundance")
+
+df_interest <- df_interest %>%
+    mutate(
+        symptom = recode(symptom, "fatigue" = "Fatigue", "pruritus" = "Pruritus", "anorexia" = "Anorexia", "nausea_vomiting" = "Nausea / vomiting", "daytime_sleepiness" = "Daytime sleepiness", "difficulty_concentrating" = "Difficulty concentrating", "bodily_pain" = "Bodily pain"),
+        severity = str_remove(severity, "grade")
+    ) %>%
+    filter(!is.na(severity))
+
+pdf("../results/figures/boxplots_abund_severity.pdf", width = 7*3.7, height = 7*4.4)
+ggplot(df_interest, aes(x = abundance, y = severity, color = severity)) +
+    geom_tufteboxplot() +
+    facet_grid(metabolite ~ symptom) +
+    theme_classic() +
+    theme(text = element_text(size = 24)) +
+    labs(x = "Metabolite abundance", y = "Symptom severity")
+dev.off()
+```
+
+Organize linear regression results.
+
+```{r}
+df_linreg_results <- df_linreg_results_lucid %>%
+    filter(metab_type != "orig", !is.na(hmdb_id)) %>%
+    select(method, symptom, event, hmdb_id, metabolite, estimate, p.value, adj_pval, metab_type, imputed_symptoms) %>%
+    pivot_wider(names_from = event, values_from = c(estimate, p.value, adj_pval)) %>% 
+    left_join(select(df_linreg_results_fair, method, symptom, hmdb_id, metabolite, estimate, p.value, adj_pval, metab_type), by = c("method", "symptom", "hmdb_id", "metab_type"), suffix = c("_lucid", "_fair")) %>%
+    mutate(analysis_version = case_when(
+        metab_type=="qrilc_ruv" & imputed_symptoms ~ "ruv_yes_imp_yes",
+        metab_type=="qrilc_ruv" & !imputed_symptoms ~ "ruv_yes_imp_no",
+        metab_type=="qrilc_no_ruv" & imputed_symptoms ~ "ruv_no_imp_yes",
+        metab_type=="qrilc_no_ruv" & !imputed_symptoms ~ "ruv_no_imp_no"
+    )) %>%
+    select(-metab_type, -imputed_symptoms, -metabolite_fair) %>% 
+    rename(metabolite = metabolite_lucid, estimate_fair = estimate, p.value_FAIR = p.value, adj_pval_FAIR = adj_pval)
+
+df_linreg_results_signif <- df_linreg_results %>%
+    filter(adj_pval_Baseline < 0.1 | `adj_pval_Year 1` < 0.1 | adj_pval_FAIR < 0.1) %>%
+    mutate(across(contains("adj_pval"), function(x) {ifelse(x < 0.1, paste("(S)", x), paste("", x))}))
+
+df_linreg_results <- df_linreg_results %>%
+    mutate(across(contains("adj_pval"), function(x) {ifelse(x < 0.1, paste("(S)", x), paste("", x))}))
+```
+
+## Unknowns
+
+Exploring unknown metabolites in the linear regression results.
+
+```{r}
+plot_known_unknown <- function(df, yvar) {
+    df %>% 
+        mutate(known = !is.na(metabolite)) %>% 
+        filter(adj_pval < 0.1) %>% 
+        ggplot(aes(x = known, y = {{ yvar }})) +
+            geom_boxplot()
+}
+
+plot_known_unknown(df = df_linreg_results_lucid, yvar = estimate)
+plot_known_unknown(df = df_linreg_results_fair, yvar = estimate)
+
+plot_known_unknown(df = df_linreg_results_lucid, yvar = adj_pval)
+plot_known_unknown(df = df_linreg_results_fair, yvar = adj_pval)
+```
+
+Exploring unknown metabolites in the limma results.
+
+```{r}
+plot_known_unknown(df = df_limma_results_lucid, yvar = symptomlevel2)
+plot_known_unknown(df = df_limma_results_fair, yvar = symptomlevel2)
+
+plot_known_unknown(df = df_limma_results_lucid, yvar = symptomlevel3)
+plot_known_unknown(df = df_limma_results_fair, yvar = symptomlevel3)
+
+plot_known_unknown(df = df_limma_results_lucid, yvar = adj_pval)
+plot_known_unknown(df = df_limma_results_fair, yvar = adj_pval)
+```
+
+Look at results tables for significant unknowns.
+
+```{r}
+df_linreg_results_lucid %>% 
+    filter(is.na(metabolite), adj_pval < 0.1) %>% 
+    arrange(desc(abs(estimate))) %>% 
+    select(event, symptom, estimate, adj_pval, metab_id, metab_type, imputed_symptoms, perc_missing)
+
+df_linreg_results_fair %>% 
+    filter(is.na(metabolite), adj_pval < 0.1) %>% 
+    arrange(desc(abs(estimate))) %>% 
+    select(event, symptom, estimate, adj_pval, metab_id, metab_type, perc_missing)
+
+df_limma_results_lucid %>% 
+    filter(is.na(metabolite), adj_pval < 0.1) %>% 
+    arrange(adj_pval, desc(pmax(abs(symptomlevel2), abs(symptomlevel3)))) %>% 
+    select(event, symptom, symptomlevel2, symptomlevel3, adj_pval, metab_id, metab_type, imputed_symptoms, perc_missing)
+
+df_limma_results_fair %>% 
+    filter(is.na(metabolite), adj_pval < 0.1) %>% 
+    arrange(adj_pval, desc(pmax(abs(symptomlevel2), abs(symptomlevel3)))) %>% 
+    select(event, symptom, symptomlevel2, symptomlevel3, adj_pval, metab_id, metab_type, perc_missing)
+```
+
+Combine results for unknown metabolites.
+
+```{r}
+get_signif_unknowns <- function(df) {
+    df %>% 
+        filter(is.na(metabolite), adj_pval < 0.1) %>%
+        select(mz, rt, symptom, method) %>%
+        unique()
+}
+
+unknowns_signif_linreg_lucid <- get_signif_unknowns(df_linreg_results_lucid %>% filter(metab_type != "orig"))
+unknowns_signif_linreg_fair <- get_signif_unknowns(df_linreg_results_fair %>% filter(metab_type != "orig"))
+unknowns_signif_limma_lucid <- get_signif_unknowns(df_limma_results_lucid %>% filter(metab_type != "orig"))
+unknowns_signif_limma_fair <- get_signif_unknowns(df_limma_results_fair %>% filter(metab_type != "orig"))
+
+unknowns_signif <- bind_rows(unknowns_signif_linreg_lucid, unknowns_signif_linreg_fair, unknowns_signif_limma_lucid, unknowns_signif_limma_fair) %>% unique()
+
+# For each metabolite in unknowns_signif, get the results for linreg and limma
+df_linreg <- bind_rows(
+    select(df_linreg_results_lucid %>% filter(is.na(metabolite)), method, mz, rt, event, symptom, estimate, p.value, adj_pval, metab_type, imputed_symptoms),
+    select(df_linreg_results_fair %>% filter(is.na(metabolite)) %>% mutate(imputed_symptoms = FALSE), method, mz, rt, event, symptom, estimate, p.value, adj_pval, metab_type, imputed_symptoms)
+)
+# %>%
+#     pivot_wider(names_from = event, values_from = c(estimate, p.value, adj_pval)) %>%
+#     arrange(paste(mz, rt), symptom, metab_type, imputed_symptoms)
+
+df_limma <- bind_rows(
+    select(
+        df_limma_results_lucid %>% filter(is.na(metabolite)),
+        method, mz, rt, event, symptom, symptomlevel2, symptomlevel3, P.Value, adj_pval, metab_type, imputed_symptoms),
+    select(
+        df_limma_results_fair %>% filter(is.na(metabolite)) %>% mutate(imputed_symptoms = FALSE),
+        method, mz, rt, event, symptom, symptomlevel2, symptomlevel3, P.Value, adj_pval, metab_type, imputed_symptoms)
+)
+# %>%
+#     pivot_wider(names_from = event, values_from = c(symptomlevel2, symptomlevel3, P.Value, adj_pval)) %>%
+#     arrange(paste(mz, rt), symptom, metab_type, imputed_symptoms)
+```
+
+For the LUCID runs (but not the FAIR runs), some unknown metabolites have different `compound_id`'s but the same m/z and RT.
+
+```{r}
+# Some metabolites have 2 p-values
+df_linreg[["adj_pval_Baseline"]] %>% lengths() %>% table()
+df_limma[["adj_pval_Baseline"]] %>% lengths() %>% table()
+
+df_linreg[["adj_pval_Year 1"]] %>% lengths() %>% table()
+df_limma[["adj_pval_Year 1"]] %>% lengths() %>% table()
+
+df_linreg[["adj_pval_FAIR"]] %>% lengths() %>% table()
+df_limma[["adj_pval_FAIR"]] %>% lengths() %>% table()
+
+
+df_limma[lengths(df_limma[["adj_pval_Baseline"]])==2,]
+
+rd_hilic_pos <- rowData(se_hilic_pos_main) %>% as.data.frame()
+
+rd_hilic_pos %>% filter(mz==128.0699, rt==9.14)
+```
+
+```{r}
+match_unknowns <- function(mz, rt, symptom, method) {
+    this_mz <- mz
+    this_rt <- rt
+    this_symptom <- symptom
+    this_method <- method
+    filter_df <- function(df, count_only = TRUE) {
+        df_clean <- df %>%
+            filter(
+                mz >= this_mz-0.05, mz <= this_mz+0.05,
+                rt >= this_rt-0.25, rt <= this_rt+0.25,
+                symptom==this_symptom,
+                method==this_method,
+                metab_type != "orig"
+            )
+        if (count_only) {
+            df_clean %>%
+                group_by(event) %>%
+                summarize(any_signif = any(adj_pval < 0.1, na.rm = TRUE))
+        } else {
+            df_clean
+        }
+    }
+    list(
+        original = tibble(mz = mz, rt = rt, symptom = symptom, method = method),
+        num_matches_limma = df_limma %>% filter_df(count_only = TRUE),
+        num_matches_linreg = df_linreg %>% filter_df(count_only = TRUE),
+        possible_matches_limma = df_limma %>% filter_df(count_only = FALSE) %>% select(-method, -symptom) %>% as.data.frame(),
+        possible_matches_linreg = df_linreg %>% filter_df(count_only = FALSE) %>% select(-method, -symptom) %>% as.data.frame()
+    )
+}
+
+unknowns_signif_matched <- pmap(unknowns_signif, match_unknowns)
+
+bool_replicated_limma <- map_lgl(unknowns_signif_matched, function(l) {
+    sum(l$num_matches_limma$any_signif) >= 2
+})
+bool_replicated_linreg <- map_lgl(unknowns_signif_matched, function(l) {
+    sum(l$num_matches_linreg$any_signif) >= 2
+})
+
+table(bool_replicated_limma)
+table(bool_replicated_linreg)
+
+unknowns_signif_matched[bool_replicated_linreg]
+```
+
+Put replication information on the unknowns in a neater data frame.
+
+```{r}
+signif_events <- map(unknowns_signif_matched, function(l) {
+    get_matches_str <- function(df) {
+        if (!any(df$any_signif)) {
+            "None"
+        } else {
+            df %>% filter(any_signif) %>% pull(event) %>% str_c(collapse = ", ")
+        }
+    }
+    matches_limma <- get_matches_str(l$num_matches_limma)
+    matches_linreg <- get_matches_str(l$num_matches_linreg)
+    
+    lucid <- l$possible_matches_limma %>% filter(event %in% c("Baseline", "Year 1")) %>% select(mz, rt) %>% unique()
+    fair <- l$possible_matches_limma %>% filter(event == "FAIR") %>% select(mz, rt) %>% unique()
+    
+    mz_lucid <- lucid %>% pull(mz) %>% unique() %>% str_c(collapse = ", ")
+    rt_lucid <- lucid %>% pull(rt) %>% unique() %>% str_c(collapse = ", ")
+    mz_fair <- fair %>% pull(mz) %>% unique() %>% str_c(collapse = ", ")
+    rt_fair <- fair %>% pull(rt) %>% unique() %>% str_c(collapse = ", ")
+    
+    len0_to_na <- function(x) {
+        if (length(x)==0) {
+            NA
+        } else {
+            x
+        }
+    }
+    
+    adj_pvals <- l$possible_matches_limma %>%
+        filter(metab_type != "orig") %>% 
+        group_by(event) %>% 
+        summarize(min_adj_pval = min(adj_pval, na.rm = TRUE))
+    adj_pval_baseline <- adj_pvals %>% filter(event=="Baseline") %>% pull(min_adj_pval) %>% len0_to_na()
+    adj_pval_year1 <- adj_pvals %>% filter(event=="Year 1") %>% pull(min_adj_pval) %>% len0_to_na()
+    adj_pval_fair <- adj_pvals %>% filter(event=="FAIR") %>% pull(min_adj_pval) %>% len0_to_na()
+    
+    res <- c(matches_limma, matches_linreg, mz_lucid, rt_lucid, mz_fair, rt_fair, adj_pval_baseline, adj_pval_year1, adj_pval_fair)
+    names(res) <- c("limma_signif_groups", "linreg_signif_groups", "mz_lucid", "rt_lucid", "mz_fair", "rt_fair", "min_limma_adj_pval_baseline", "min_limma_adj_pval_year1", "min_limma_adj_pval_fair")
+    res
+}) %>% bind_rows()
+
+unknowns_signif_rep_info <- bind_cols(unknowns_signif, signif_events) %>% 
+    mutate(is_replicated = str_detect(limma_signif_groups, ",") | str_detect(linreg_signif_groups, ","))
+```
+
+Add adjusted p-value information.
+
+```{r}
+df_limma_wide <- df_limma %>%
+    select(-c(symptomlevel2, symptomlevel3, P.Value)) %>% 
+    mutate(event = str_remove(event, " ")) %>% 
+    group_by(method, mz, rt, symptom, event, metab_type, imputed_symptoms) %>% 
+    summarize(adj_pval = min(adj_pval)) %>% 
+    ungroup() %>% 
+    pivot_wider(id_cols = c(method, mz, rt, symptom), names_from = c(event, metab_type, imputed_symptoms), values_from = adj_pval)
+
+temp <- unknowns_signif_rep_info %>%
+    left_join(df_limma_wide %>% select(-contains("_orig_")), by = c("mz", "rt", "symptom", "method"))
+```
+
+Write results tables to file.
+
+```{r}
+# limma+ML results
+# Only significant results
+df_results_signif_all_versions <- bind_rows(res_ruv, res_no_ruv, res_ruv_no_imp_symp, res_no_ruv_no_imp_symp)
+write_csv(df_results_signif_all_versions, file = "../results/tables/symptoms_results_signif_limma_ml_all_versions.csv")
+
+# All results
+write_csv(df_results_all_versions, file = "../results/tables/symptoms_results_all_limma_ml_all_versions.csv")
+
+# OLS results
+write_csv(df_linreg_results, file = "../results/tables/symptoms_results_all_linreg_all_versions.csv")
+write_csv(df_linreg_results_signif, file = "../results/tables/symptoms_results_signif_linreg_all_versions.csv")
+
+# Unknowns
+write_csv(unknowns_signif_rep_info %>% select(-mz, -rt), "../results/tables/symptoms_results_unknowns.csv")
+```
+
+

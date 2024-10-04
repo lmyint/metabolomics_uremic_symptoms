@@ -1,0 +1,1798 @@
+---
+title: "LUCID: Data Cleaning and QC Checks"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+    
+```{r setup, include=FALSE}
+lib_paths <- .libPaths()
+lib_paths <- c("//win.ad.jhu.edu/Users$/HOME/R/win-library/4.0", lib_paths)
+.libPaths(lib_paths)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center", fig.width=12)
+```
+
+# Load packages and read data
+
+Load packages and utility functions.
+
+```{r message=FALSE}
+library(SummarizedExperiment)
+library(matrixStats)
+library(readxl)
+library(tidyverse)
+library(lubridate)
+
+source("functions_utils.R")
+source("functions_qc.R")
+```
+
+Read in metabolomics data.
+
+```{r}
+se_c8 <- read_broad_data(
+    file = "../data/19_0213_Lucid_C8-pos_results.xlsx", 
+    range_abund = "H10:APT8094", 
+    range_row_data = "A9:G8094", 
+    range_col_data = "A1:I1106",
+    injection = "C8"
+)
+
+se_hilic_pos <- read_broad_data(
+    file = "../data/19_0213_Lucid_HILIC-pos_results.xlsx", 
+    range_abund = "H10:APV23354", 
+    range_row_data = "A9:G23354", 
+    range_col_data = "A1:I1108",
+    injection = "HILIC-pos"
+)
+
+se_hilic_neg <- read_broad_data(
+    file = "../data/19_0213_Lucid_HILIC-neg_results.xlsx", 
+    range_abund = "H11:AQA2134", 
+    range_row_data = "A10:G2134", 
+    range_col_data = "A1:J1113",
+    injection = "HILIC-neg"
+)
+```
+
+Read in Redcap data: demographic and medical information
+
+- Proton ID
+
+```{r}
+redcap <- read_excel("../data/US Lucid redcap_9 21 2018_no IDs.xlsx", guess_max = 5000)
+colnames(redcap) <- fix_names(colnames(redcap))
+```
+
+Read in KDQOL survey.
+
+- Participant ID
+- PROTON ID
+
+```{r}
+kdqol <- read_excel("../data/US Lucid KDOQLSurvey_9 21 2018_mod_11302019.xlsx")
+colnames(kdqol) <- fix_names(colnames(kdqol))
+```
+
+Read in FAIR data (external validation)
+
+```{r}
+fair <- read_excel("../data/Hopkins FAIR Study Data/Original.Data from Olivia/Updated.05042022/FAIR Metabolomics_KDQOL_20220504.xlsx", range = "A1:GK374")
+```
+
+Read in Canadian data. Skip the following sheets:
+
+- `access_history`: we're not going to include hemodialysis access site in our models
+- `hui`: contains vision, hearing, speech, etc. scores
+- `hospitalizations`: contains variables that we likely aren't using: `dayshosp`, `los`, `hosp_icd10dx_code1`
+
+```{r}
+can_bl <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "baseline", range = "A1:N351")
+can_bl_y1 <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "baseline_year1", range = "A1:Q501")
+can_social <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "social", range = "A1:D1369")
+can_esrd <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "esrd", range = "A1:E351")
+can_morbid <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "morbidities", range = "A1:E8051")
+can_labs <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "labs", range = "A1:F3727")
+can_meds <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "medications", range = "A1:E1805")
+can_kdqol <- read_excel("../data/LUCID-Canadian Data/ckdcs_metabolomics_04052022.xls", sheet = "kdqol", range = "A1:G32017")
+```
+
+Separate QC samples from main study samples.
+
+```{r}
+se_c8_split <- split_experiment(se_c8)
+se_hilic_pos_split <- split_experiment(se_hilic_pos)
+se_hilic_neg_split <- split_experiment(se_hilic_neg)
+```
+
+
+
+
+
+# Merge Canadian data into one `data.frame`
+
+Widen long datasets.
+
+```{r}
+# Social variables
+can_social_wide <- can_social %>%
+    mutate(
+        question = case_when(
+            str_detect(question, "Most Appropriate Employment") ~ "employ_pre_dialysis",
+            str_detect(question, "Education") ~ "education_highest",
+            str_detect(question, "Present Employment") ~ "employ_present",
+            str_detect(question, "Occupation") ~ "occupation_pre_esrd"
+        )
+    ) %>%
+    pivot_wider(names_from = "question", values_from = "answer")
+length(unique(can_social$cbsr_id))
+length(unique(can_social_wide$cbsr_id))
+
+# ESRD (not actually widening - just renaming columns and getting rid of unnecessary ones)
+can_esrd_wide <- can_esrd %>%
+    select(-category, -question) %>%
+    dplyr::rename(esrd_cause = answer)
+
+
+# Comorbidities
+can_morbid_questions <- can_morbid %>% select(question) %>% unique()
+can_morbid_questions$question_short <- c("angina_blocks_walked", "cardiac_arrythmias", "angina", "congestive_heart_failure", "cad", "cardiac_arrest", "cardiac_angioplasty", "carotid_endarterectomy", "mi", "defibrillator", "cabg", "stenting", "pacemaker", "diabetes", "diabetic_retinopathy", "insulin_immediately", "diabetes_duration", "amputations_vascular", "claudication", "hypertension", "gangrene", "periph_vasc_intervention", "abdominal_aneurysm")
+can_morbid_wide <- can_morbid %>%
+    left_join(can_morbid_questions) %>%
+    select(-question, -category) %>%
+    filter(!(question_short %in% c("angina_blocks_walked", "angina", "congestive_heart_failure", "cardiac_angioplasty", "carotid_endarterectomy", "defibrillator", "cabg", "stenting", "pacemaker", "diabetic_retinopathy", "insulin_immediately", "diabetes_duration", "amputations_vascular", "claudication", "gangrene", "periph_vasc_intervention", "abdominal_aneurysm"))) %>%
+    pivot_wider(names_from = "question_short", values_from = "answer")
+
+# Labs
+can_labs_wide <- can_labs %>%
+    pivot_wider(names_from = "labtest", values_from = "labresult")
+
+# KDQOL
+can_kdqol_questions <- tibble(
+    question = c("During The Past 4 Weeks, To What Extent Were You Bothered By Each Of The Following: Washed Out Or Drained?", "During The Past 4 Weeks, To What Extent Were You Bothered By Each Of The Following: Itchy Skin?", "During The Past 4 Weeks, To What Extent Were You Bothered By Each Of The Following: Lack Of Appetite?", "During The Past 4 Weeks, To What Extent Were You Bothered By Each Of The Following: Nausea Or Upset Stomach?", "How Often During The Past 4 Weeks Did You... Have Trouble Staying Awake During The Day?", "Regarding How You Feel And How Things Have Been Going, How Much Of The Time During The Past 4 Weeks... Did You Have Difficulty Concentrating OrThinking?", "How Much Bodily Pain Have You Had During The Past 4 Weeks?", "Does Your Health Limit These Typical Daily Activities? If So, How Much?: Climbing One Flight Of Stairs.", "Does Your Health Limit These Typical Daily Activities? If So, How Much?: Climbing Several Flights Of Stairs.", "Does Your Health Limit These Typical Daily Activities? If So, How Much?: Moderate Activities Such As Moving A Table, Pushing A Vacuum Cleaner, Bowling, Or Playing Golf.", "Does Your Health Limit These Typical Daily Activities? If So, How Much?: Vigorous Activities Such As Running, Lifting Heavy Objects, Participating In Strenous Sports.", "Does Your Health Limit These Typical Daily Activities? If So, How Much?: Walking One Block.", "Does Your Health Limit These Typical Daily Activities? If So, How Much?: Walking Several Blocks.", "Does Your Health Limit These Typical Daily Activities? If So, How Much?: Walking More Than A Mile."),
+    question_short = c("fatigue", "pruritus", "anorexia", "nausea_vomiting", "daytime_sleepiness", "difficulty_concentrating", "bodily_pain", "climb_one_flight", "climb_several_flights", "moderate_activity", "vigorous_activity", "walk_one_block", "walk_several_blocks", "walk_mile_more")
+)
+
+can_kdqol_wide <- can_kdqol %>%
+    left_join(can_kdqol_questions) %>%
+    select(-question, -category, -daysinterview) %>%
+    filter(!is.na(question_short)) %>%
+    pivot_wider(names_from = "question_short", values_from = "answer")
+```
+
+Tabulate missingness information on KDQOL data.
+
+```{r}
+can_kdqol_na_info <- can_kdqol %>%
+    mutate(is_miss = is.na(answer)) %>%
+    group_by(question) %>%
+    summarize(num_miss = sum(is_miss), perc_miss = mean(is_miss), tot_n = n()) %>%
+    left_join(can_kdqol_questions) %>%
+    select(question, question_short, everything())
+write_csv(can_kdqol_na_info, "../data/can_kdqol_missingness.csv")
+```
+
+Create a dataset of time-fixed covariates: (Relevant sheets: baseline, social, esrd, morbidities)
+
+```{r}
+can_time_fixed <- full_join(can_bl, can_social_wide) %>%
+    full_join(can_esrd_wide) %>%
+    full_join(can_morbid_wide)
+```
+
+Create a dataset of covariates that differ across baseline and Year 1.
+
+```{r}
+can_time_vary <- full_join(
+        can_bl_y1,
+        select(can_labs_wide, -daysinterview)
+    ) %>%
+    full_join(can_kdqol_wide)
+```
+
+Merge all covariates into one dataset. There should be 350 total patients (`studynum`), 500 unique sample IDs (`cbsr_id`), 350 records of Baseline, and 150 records of Year1.
+
+```{r}
+can_data_all <- can_time_vary %>%
+    left_join(select(can_time_fixed, -cbsr_id))
+
+cat("# patients:", length(unique(can_data_all$studynum)), "\n")
+cat("# sample IDs:", length(unique(can_data_all$cbsr_id)), "\n")
+can_data_all %>%
+    count(interview)
+
+rm(can_bl, can_bl_y1, can_social, can_esrd, can_morbid, can_labs, can_meds, can_kdqol, can_social_wide, can_esrd_wide, can_morbid_questions, can_morbid_wide, can_labs_wide, can_kdqol_questions, can_kdqol_wide, can_kdqol_na_info, can_time_fixed, can_time_vary)
+```
+
+
+
+
+
+# Data checking
+
+```{r}
+check_sample_ids <- function(se_c8, se_hilic_pos, se_hilic_neg, group) {
+    sids_c8 <- colData(se_c8[[group]])$sample_id
+    sids_hilic_pos <- colData(se_hilic_pos[[group]])$sample_id
+    sids_hilic_neg <- colData(se_hilic_neg[[group]])$sample_id
+
+    sids_info <- check_ids(sids_c8, sids_hilic_pos, sids_hilic_neg)
+    colnames(sids_info) <- c("sid", "in_c8", "in_hilic_pos", "in_hilic_neg", "in_all")
+    
+    sids_info
+}
+```
+
+## Main study samples
+
+### Checking sample IDs
+
+There are 8 main study samples that are only measured for 1 or 2 of the 3 injections.
+
+```{r}
+sids_info_main <- check_sample_ids(
+    se_c8 = se_c8_split,
+    se_hilic_pos = se_hilic_pos_split,
+    se_hilic_neg = se_hilic_neg_split, 
+    group = "main"
+)
+
+sids_info_main %>%
+    filter(!in_all)
+```
+
+**RESOLVED:** According to a 03/03/2021 email with Eugene, the following row pairs are the same sample. 
+
+- 1,5
+- 2,8
+- 3,6
+- 4,7
+
+Confirm that the pairs have the same proton ID:
+
+- Yes for the 1,5 pair
+- The other 3 pairs are Canadian LUCID samples and don't have proton IDs.
+
+```{r}
+show_proton_id <- function(sid_c8, sid_hilic_pos, sid_hilic_neg) {
+    cat("Sample IDs: C8:", sid_c8, "HILIC+:", sid_hilic_pos, "HILIC-:", sid_hilic_neg, "\n")
+    colData(se_c8) %>% as.data.frame() %>% filter(sample_id == sid_c8) %>% pull(proton_id) %>% cat("\n")
+    colData(se_hilic_pos) %>% as.data.frame() %>% filter(sample_id == sid_hilic_pos) %>% pull(proton_id) %>% cat("\n")
+    colData(se_hilic_neg) %>% as.data.frame() %>% filter(sample_id == sid_hilic_neg) %>% pull(proton_id) %>% cat("\n")
+}
+
+# SLU-0032 and SLU-032
+show_proton_id(sid_c8 = "SLU-0032", sid_hilic_pos = "SLU-032", sid_hilic_neg = "SLU-032")
+
+# NUET320380 and NUET320380_20201207094313
+show_proton_id(sid_c8 = "NUET320380", sid_hilic_pos = "NUET320380", sid_hilic_neg = "NUET320380_20201207094313")
+
+# NUBT4109015 and NUBT409015
+show_proton_id(sid_c8 = "NUBT4109015", sid_hilic_pos = "NUBT409015", sid_hilic_neg = "NUBT409015")
+
+# NUET323457 and NUET323457-ra
+show_proton_id(sid_c8 = "NUET323457", sid_hilic_pos = "NUET323457", sid_hilic_neg = "NUET323457-ra")
+```
+
+Fix typos in the above Sample IDs so that the Sample IDs across files match up.
+
+```{r}
+cd_c8 <- colData(se_c8)
+cd_c8$sample_id[cd_c8$sample_id=="SLU-0032"] <- "SLU-032"
+cd_c8$sample_id[cd_c8$sample_id=="NUBT4109015"] <- "NUBT409015"
+colData(se_c8) <- cd_c8
+
+cd_hilic_neg <- colData(se_hilic_neg)
+cd_hilic_neg$sample_id[cd_hilic_neg$sample_id=="NUET320380_20201207094313"] <- "NUET320380"
+cd_hilic_neg$sample_id[cd_hilic_neg$sample_id=="NUET323457-ra"] <- "NUET323457"
+colData(se_hilic_neg) <- cd_hilic_neg
+```
+
+Function for checking other aspects of colData.
+
+```{r}
+check_other_coldata <- function(se, redcap) {
+    cd <- colData(se) %>% as.data.frame()
+    
+    ## Any sample IDs duplicated?
+    dup <- cd$sample_id[duplicated(cd$sample_id)]
+    dup_sid <- cd %>% filter(sample_id %in% dup) %>% arrange(sample_id, event_name)
+    
+    ## What event (visit) does this sample correspond to?
+    tab <- table(cd$event_name, useNA = "ifany")
+    
+    ## Do the proton IDs for these samples exist in Redcap data?
+    no_proton_id_red <- anti_join(cd, redcap, by = "proton_id")
+    ## ...in the KDQOL data?
+    no_proton_id_kdqol <- anti_join(cd, kdqol, by = "proton_id")
+    
+    list(dup_sid = dup_sid, tab_event = tab, no_proton_id_red = no_proton_id_red, no_proton_id_kdqol = no_proton_id_kdqol)
+}
+
+coldata_check_c8 <- check_other_coldata(se_c8_split$main, redcap)
+coldata_check_hilic_pos <- check_other_coldata(se_hilic_pos_split$main, redcap)
+coldata_check_hilic_neg <- check_other_coldata(se_hilic_neg_split$main, redcap)
+```
+
+### Checking duplication of sample IDs
+
+Only the C8 injection ran the same sample multiple times (for QC reasons).
+
+```{r}
+coldata_check_c8$dup_sid
+coldata_check_hilic_pos$dup_sid
+coldata_check_hilic_neg$dup_sid
+```
+
+### Checking event names/visit numbers
+
+**Note about naming of events/visits:** The terms are made consistent in `merge_redcap_kdqol()` in `functions_utils.R`.
+
+For the US patients...
+
+- "Event 1" means "Baseline"
+- "Followup Year 1" means "Year 1"
+
+For the Canadian patients...
+
+- "Baseline" means "Baseline"
+- "Year1" means "Year 1"
+
+```{r}
+coldata_check_c8$tab_event
+coldata_check_hilic_pos$tab_event
+coldata_check_hilic_neg$tab_event
+
+redcap %>% dplyr::count(event_name)
+kdqol %>% dplyr::count(visit)
+```
+
+In the HILIC- injection, there are two samples that have NA for the visit represented - the sample IDs are shown below. These two samples are among those encountered above where slightly different sample IDs were used across the 3 injections:
+
+- `NUET320380_20201207094313` is the same as `NUET320380`.
+- `NUET323457-ra` is the same as `NUET323457`.
+
+According to the C8 and HILIC-pos data, the event should be Year 1.
+
+```{r}
+## Obtain the sample IDs for the cases with event = "NA"
+colData(se_hilic_neg) %>%
+    as.data.frame() %>%
+    filter(event_name=="NA", !str_detect(sample_id, "PREF")) %>%
+    select(sample_id, proton_id)
+
+## What event should they be? Check in C8 and HILIC-pos
+colData(se_c8) %>%
+    as.data.frame() %>%
+    filter(sample_id %in% c("NUET320380", "NUET323457")) %>%
+    select(sample_id, proton_id, event_name)
+colData(se_hilic_pos) %>%
+    as.data.frame() %>%
+    filter(sample_id %in% c("NUET320380", "NUET323457")) %>%
+    select(sample_id, proton_id, event_name)
+```
+
+Fix event name in HILIC- injection.
+
+```{r}
+cd <- colData(se_hilic_neg)
+cd$event_name[cd$sample_id %in% c("NUET323457", "NUET320380")] <- "Year1"
+colData(se_hilic_neg) <- cd
+```
+
+There are 500 samples in each injection that don't have Proton IDs in the Redcap data. These are the Canadian samples. (All Canadian sample IDs start with "NU" or are 4 letter codes.)
+
+```{r}
+coldata_check_c8$no_proton_id_red
+coldata_check_hilic_pos$no_proton_id_red
+coldata_check_hilic_neg$no_proton_id_red
+
+coldata_check_c8$no_proton_id_red %>% rownames() %>% str_detect("^NU") %>% table()
+coldata_check_hilic_pos$no_proton_id_red %>% rownames() %>% str_detect("^NU") %>% table()
+coldata_check_hilic_neg$no_proton_id_red %>% rownames() %>% str_detect("^NU") %>% table()
+
+rn <- rownames(coldata_check_c8$no_proton_id_red)
+non_nu_ids_c8 <- sort(rn[!str_detect(rn, "^NU")])
+rn <- rownames(coldata_check_hilic_pos$no_proton_id_red)
+non_nu_ids_pos <- sort(rn[!str_detect(rn, "^NU")])
+rn <- rownames(coldata_check_hilic_neg$no_proton_id_red)
+non_nu_ids_neg <- sort(rn[!str_detect(rn, "^NU")])
+identical(non_nu_ids_c8, non_nu_ids_pos)
+identical(non_nu_ids_pos, non_nu_ids_neg)
+non_nu_ids_c8
+```
+
+2 Seattle LUCID samples and the 500 Canadian samples seem to be missing KDQOL data.
+
+```{r}
+coldata_check_c8$no_proton_id_kdqol
+coldata_check_hilic_pos$no_proton_id_kdqol
+coldata_check_hilic_neg$no_proton_id_kdqol
+
+check_ids(
+    rownames(coldata_check_c8$no_proton_id_kdqol),
+    rownames(coldata_check_hilic_pos$no_proton_id_kdqol),
+    rownames(coldata_check_hilic_neg$no_proton_id_kdqol)
+) %>% dplyr::filter(!in_all)
+```
+
+The 2 "missing" Seattle samples are actually due to a lowercase vs. uppercase "P" in the proton ID.
+
+```{r}
+colData(se_c8_split$main) %>%
+    as.data.frame() %>%
+    left_join(kdqol, by = "proton_id") %>%
+    filter(sample_id %in% c("SLU-002", "SLU-003")) %>%
+    select(sample_id, proton_id)
+
+c("3460P", "3426P") %in% kdqol$proton_id
+str_detect(kdqol$proton_id, "3460") %>% which()
+str_detect(kdqol$proton_id, "3426") %>% which()
+kdqol$proton_id[c(834, 835)]
+
+## Fix lowercase->uppercase in kdqol
+kdqol$proton_id[c(834, 835)] <- toupper(kdqol$proton_id[c(834, 835)])
+```
+
+## QC samples
+
+The number and naming (trailing numbers at the end of PREFA/B) of the QC samples could have varied from injection to injection - **don't worry about this?**
+
+```{r}
+sids_info_qca <- check_sample_ids(
+    se_c8 = se_c8_split,
+    se_hilic_pos = se_hilic_pos_split,
+    se_hilic_neg = se_hilic_neg_split, 
+    group = "qc_a"
+)
+sids_info_qcb <- check_sample_ids(
+    se_c8 = se_c8_split,
+    se_hilic_pos = se_hilic_pos_split,
+    se_hilic_neg = se_hilic_neg_split, 
+    group = "qc_b"
+)
+
+sids_info_qca %>%
+    filter(!in_all)
+sids_info_qcb %>%
+    filter(!in_all)
+```
+
+## Checking covariates to be used in adjusted models
+
+- age
+    - LUCID: age...5, age...364
+    - FAIR: age
+- sex
+    - LUCID: gender
+    - FAIR: sex
+- race-ethnicity
+    - LUCID: race
+    - FAIR: race_eth
+- BMI
+    - LUCID: bmi, bmi_this_visit
+    - FAIR: bmi
+- cardiovascular disease
+    - LUCID: 
+        - [1] "has_the_subject_ever_had_a_cardiac_arrest?"        
+        - [2] "does_the_subject_have_clinically_documented_cardiac_arrhythmias?"
+        - [3] "has_the_subject_had_an_echocardiogram_echo_within_6_months_of_starting_dialysis?"
+        - [4] "has_the_subject_ever_had_a_clinically_documented_myocardial_infarction_(mi)?"
+        - [5] "has_the_subject_ever_had_a_cardiac_angioplasty_or_stenting?"
+        - [6] "cardiac_cause"
+    - FAIR:
+        - hea5a	5.A. Myocardial infarction?
+        - hea5b	5.B. Peripheral vascular disease?
+        - hea5c	5.C. Cerebral vascular disease? 
+- diabetes
+    - LUCID:
+        - [1] "does_the_subject_have_clinically_documented_diabetes"
+        - [2] "if_diabetic,_how_long_has_the_subject_had_it?"
+        - [3] "if_diabetic,_did_the_subject_require_insulin_immediately_upon_diagnosis?"
+        - [4] "does_the_subject_have_diabetic_retinopathy?"
+    - FAIR:
+        - hea5h	5.H. Diabetes?
+        - hea5i	5.I. Diabetes with complications?
+- residual kidney function: **WHAT VARIABLES WOULD I BE LOOKING FOR HERE?** - urea and creatinine clearance through urine
+    - LUCID:
+        - Possibilities: `Is the subject producing urine`, `Frequency of urination/day`
+    - FAIR: 
+- serum albumin
+    - LUCID: alb_0 in IU data
+    - FAIR: lab_value12	ALBUMIN (g/dL)
+- hemoglobin
+    - LUCID: hgb_0 in IU data
+    - FAIR: lab_value10	HGB (g/dL)
+- ferritin
+    - LUCID: Fer_0 in IU data
+    - FAIR: missing?
+- phosphate
+    - LUCID: phos_0 in IU data
+    - FAIR:
+        - lab_value14	PHOS (mg/dL)
+        - lab_value13	ALKPHOS (U/L)
+- parathyroid hormone
+    - LUCID: PTH_0 in IU data
+    - FAIR: missing?
+- medications
+    - LUCID: last columns in IU data
+    - FAIR: missing?
+- HD (hemodialysis) vascular access
+    - LUCID:
+        - [2] "what_access_is_patient_currently_using?__(choice=catheter)"
+        - [3] "what_access_is_patient_currently_using?__(choice=fistula)"
+        - [4] "what_access_is_patient_currently_using?__(choice=graft)"
+        - [5] "what_access_is_patient_currently_using?__(choice=pd)"
+    - FAIR: missing?
+
+```{r}
+find_variable <- function(lucid, fair, pattern) {
+    lucid_vars <- colnames(lucid)
+    fair_vars <- colnames(fair)
+    cat("LUCID\n")
+    print(lucid_vars[str_detect(lucid_vars, pattern)])
+    cat("\nFAIR\n")
+    print(fair_vars[str_detect(fair_vars, pattern)])
+}
+
+cd <- colData(se_c8) %>% as.data.frame() %>%
+    mutate(
+            event_name = case_when(
+                event_name=="Event 1" ~ "Baseline",
+                event_name %in% c("Followup Year 1", "Year1") ~ "Year 1",
+                TRUE ~ event_name
+            )
+        ) %>%
+    left_join(redcap %>%
+        mutate(
+            event_name = case_when(
+                event_name=="Event 1" ~ "Baseline",
+                event_name=="Followup Year 1" ~ "Year 1",
+                TRUE ~ event_name
+            )
+        ), by = c("proton_id", "event_name")
+    ) %>%
+    left_join(kdqol %>% 
+        mutate(
+            visit = case_when(
+                visit=="1 year" ~ "Year 1",
+                TRUE ~ visit
+            )
+        ), by = c("proton_id" = "proton_id", "event_name" = "visit")
+    )
+```
+
+```{r}
+find_variable(lucid = cd, fair = fair, pattern = "age")
+plot(cd[["age...5"]], cd[["age...364"]])
+abline(a = 0, b = 1, col = "red")
+summary(abs(cd[["age...5"]]-cd[["age...364"]]))
+summary(cd[["age...5"]])
+summary(cd[["age...364"]])
+summary(fair$age)
+```
+
+```{r}
+find_variable(lucid = cd, fair = fair, pattern = "sex|gender")
+dplyr::count(cd, gender)
+dplyr::count(fair, sex)
+```
+
+```{r}
+find_variable(lucid = cd, fair = fair, pattern = "race|eth")
+dplyr::count(cd, race)
+dplyr::count(cd, ethnicity)
+dplyr::count(cd, ethnicity, race)
+dplyr::count(fair, race_eth)
+```
+
+```{r}
+find_variable(lucid = cd, fair = fair, pattern = "bmi")
+plot(cd[["bmi"]], cd[["bmi_this_visit"]])
+abline(a = 0, b = 1, col = "red")
+summary(cd$bmi)
+summary(cd$bmi_this_visit)
+summary(fair$bmi)
+dplyr::count(cd, date_this_form_was_completed)
+```
+
+```{r}
+find_variable(lucid = cd, fair = fair, pattern = "card|coron|vasc|arter")
+find_variable(lucid = cd, fair = fair, pattern = "diab")
+find_variable(lucid = cd, fair = fair, pattern = "alb")
+find_variable(lucid = cd, fair = fair, pattern = "hemo")
+find_variable(lucid = cd, fair = fair, pattern = "ferr")
+find_variable(lucid = cd, fair = fair, pattern = "phos")
+find_variable(lucid = cd, fair = fair, pattern = "parathy|pth")
+find_variable(lucid = cd, fair = fair, pattern = "access")
+```
+
+### Cleaning up missing values for age, sex, race/ethnicity, date of first dialysis, and date of sample collection
+
+Carefully handle merging for age, sex, race because the Excel sheets only record this information for the first visit for a given patient (NAs for other observations). Need to actually recalculate age for subsequent visits.
+
+```{r}
+proton_ids <- unique(redcap$proton_id)
+
+count_covariate_values <- function(covariate) {
+    nums_unique_covariate_values <- sapply(proton_ids, function(id) {
+        redcap_subs <- redcap %>% filter(event_name %in% c("Event 1", "Followup Year 1"), proton_id==id)
+        unique_covariate_values <- setdiff(redcap_subs[[covariate]], NA)
+        length(unique_covariate_values)
+    })
+    unique(nums_unique_covariate_values)
+}
+
+count_covariate_values("age...5")
+count_covariate_values("gender")
+count_covariate_values("race")
+count_covariate_values("ethnicity")
+count_covariate_values("bmi")
+count_covariate_values("date_of_first_dialysis")
+
+count_covariate_values("does_the_subject_have_clinically_documented_coronary_artery_disease_(cad)")
+count_covariate_values("has_the_subject_ever_had_a_cardiac_arrest")
+count_covariate_values("does_the_subject_have_clinically_documented_cardiac_arrhythmias")
+count_covariate_values("has_the_subject_ever_had_a_clinically_documented_myocardial_infarction_(mi)")
+
+count_covariate_values("does_the_subject_have_clinically_documented_diabetes")
+```
+
+At what event (visit) was age recorded? (Should all be Event 1/baseline) - **YES**
+
+```{r}
+event_recorded_age <- lapply(proton_ids, function(id) {
+    redcap_subs <- redcap %>% filter(proton_id==id, !is.na(age...5))
+    redcap_subs$event_name
+})
+unique(unlist(event_recorded_age))
+```
+
+Why do some patients have 2 records for date of first dialysis? **I will assume that the earliest date for a given patient is their actual date of first dialysis.**
+
+```{r}
+redcap %>%
+    group_by(proton_id) %>%
+    summarize(num_dofd = length(setdiff(date_of_first_dialysis, NA))) %>%
+    filter(num_dofd > 1)
+
+redcap %>% filter(proton_id %in% c("154300", "17")) %>% select(proton_id, event_name, date_of_first_dialysis)
+```
+
+Create a complete version of the Redcap data where age, gender, race, and date of first dialysis are filled in for each visit.
+
+```{r}
+get_single_covariate_value <- function(x) {
+    if (all(is.na(x))) {
+        NA
+    } else {
+        setdiff(x, NA)
+    }
+}
+get_first_date <- function(x) {
+    sort(x)[1]
+}
+redcap_complete <- redcap %>%
+    group_by(proton_id) %>%
+    mutate(
+        gender = get_single_covariate_value(gender),
+        race = get_single_covariate_value(race),
+        ethnicity = get_single_covariate_value(ethnicity),
+        date_of_first_dialysis = ymd(date_of_first_dialysis),
+        date_of_first_dialysis = get_first_date(date_of_first_dialysis)
+    ) %>%
+    select(proton_id, event_name, age = age...5, race, gender, ethnicity, date_of_first_dialysis, date_sample_collected) %>%
+    ungroup()
+```
+
+Fix missing values for date of sample collection.
+
+```{r}
+redcap_complete <- redcap_complete %>%
+    mutate(
+        date_sample_collected = ymd(date_sample_collected),
+        event_name_days = case_when(
+            event_name=="Event 1" ~ 0,
+            event_name=="Followup 6 month" ~ 183,
+            event_name=="Followup Year 1" ~ 365,
+            event_name=="Followup Year 2" ~ 730,
+            event_name=="Study Completion" ~ NA_real_
+        ),
+        date_sample_collected_baseline = date_sample_collected - event_name_days,
+        dialysis_duration = date_sample_collected - date_of_first_dialysis
+    )
+
+for (id in proton_ids) {
+    redcap_subs <- redcap_complete %>%
+        filter(proton_id==id) %>%
+        arrange(event_name_days)
+    has_event1 <- "Event 1" %in% redcap_subs$event_name
+    if (!has_event1)
+        next
+    event1_coll_date <- redcap_subs %>%
+        filter(event_name=="Event 1") %>%
+        pull(date_sample_collected)
+    has_event1_coll_date <- !is.na(event1_coll_date)
+    if (has_event1_coll_date) {
+        next
+    } else {
+        possible_event1_dates <- redcap_subs %>%
+            pull(date_sample_collected_baseline)
+        if (all(is.na(possible_event1_dates)))
+            next
+        possible_event1_dates <- possible_event1_dates[!is.na(possible_event1_dates)]
+        event1_coll_date <- possible_event1_dates[1]
+        bool_this_patient <- redcap_complete$proton_id==id
+        redcap_complete$dialysis_duration[bool_this_patient] <- as.integer(event1_coll_date - redcap_complete$date_of_first_dialysis[bool_this_patient][1])
+    }
+}
+redcap_complete$dialysis_duration <- as.numeric(redcap_complete$dialysis_duration)
+```
+
+Check created dialysis duration variable. Set dialysis_duration to `NA` for any 
+
+```{r}
+redcap_complete %>%
+    filter(dialysis_duration <= 0) %>%
+    select(date_of_first_dialysis, date_sample_collected, dialysis_duration)
+
+redcap_complete %>%
+    filter(proton_id %in% c("58", "187", "301833", "512670", "3520P")) %>%
+    select(date_of_first_dialysis, date_sample_collected, dialysis_duration)
+
+redcap_complete <- redcap_complete %>%
+    mutate(dialysis_duration = ifelse(dialysis_duration < 0, NA_real_, dialysis_duration))
+```
+
+Fix one incorrect value for age.
+
+```{r}
+## Check that there is only 1 patient with the incorrect age
+redcap_complete %>% filter(age < 0.4848, age > 0.4846)
+
+## Fix this patient's age to be 72.4847 (Eugene's email: Tue 11/30 7:03PM)
+redcap_complete$age[redcap_complete$age < 0.4848 & redcap_complete$age > 0.4846] <- 72.4847
+
+## Instead of calculating age at each visit, just use age at baseline to be consistent with Canadian data
+for (id in proton_ids) {
+    age_baseline <- redcap_complete %>%
+        filter(proton_id==id, event_name=="Event 1") %>%
+        pull(age)
+    if (length(age_baseline)==0)
+        next
+    bool_this_patient <- redcap_complete$proton_id==id
+    redcap_complete$age[bool_this_patient] <- age_baseline
+}
+
+redcap_new <- redcap %>%
+    select(-gender, -race, -ethnicity, -date_of_first_dialysis, -date_sample_collected) %>%
+    left_join(redcap_complete, by = c("proton_id", "event_name"))
+
+## Recode race categories
+redcap_new <- redcap_new  %>%
+    mutate(
+        race = case_when(
+            race %in% c("Asian", "Native Hawaiian or other Pacific Islander") ~ "Asian_PI",
+            race=="Black or African American" ~ "Black",
+            race=="More than One Race" ~ "Other",
+            race=="Unknown or not reported" ~ NA_character_,
+            TRUE ~ race
+        )
+    )
+```
+
+### Cleaning up coding for gender and ethnicity in Canadian data
+
+```{r}
+can_data_all %>% count(sex)
+can_data_all %>% count(ethnicity)
+
+can_data_all <- can_data_all %>%
+    dplyr::rename(age = age_baseline, gender = sex, race = ethnicity) %>%
+    mutate(
+        gender = ifelse(gender=="F", "Female", "Male"),
+        race = case_when(
+            str_detect(race, "Aboriginal") ~ "Other",
+            str_detect(race, "Asian") ~ "Asian_PI",
+            str_detect(race, "Black") ~ "Black",
+            str_detect(race, "Caucasian/White") ~ "White",
+            str_detect(race, "Indian Sub-continent") ~ "Asian_PI",
+            str_detect(race, "Mid East") ~ "Asian_PI",
+            str_detect(race, "Multiracial") ~ "Other",
+            str_detect(race, "Pacific Islander") ~ "Asian_PI"
+        )
+    )
+```
+
+
+### Cleaning up CV disease and diabetes variables
+
+Full set of CV disease variables:
+
+- Does the subject have clinically documented Coronary Artery Disease (CAD)?
+- Has the subject ever had a cardiac arrest?
+- Does the subject have clinically documented cardiac arrhythmias?
+- Does the subject have clinically documented Congestive Heart Failure (CHF)
+- Does the subject have a clinically documented angina (chest pain)?
+- If yes, how many level city blocks can they walk without getting chest pain?
+- Has the subject had an ECG within 6 months of starting dialysis?
+- If they have had a ECG, what is the date	What are the results of the most recent ECG?
+- Has the subject had an echocardiogram ECHO within 6 months of starting dialysis?
+- Date of ECHO
+- What are the results of the most recent ECHO?
+- Where was the ECHO performed (city or facility)
+- Has the subject ever had a clinically documented Myocardial infarction (MI)?
+- Has the subject ever had coronary artery bypass surgery?
+- Has the subject ever had a cardiac angioplasty or stenting?
+- Has the subject ever had carotid endarterctomy
+- Has the subject ever had an implantable defibrillator?
+- Has the subject had a permanent pacemaker implant?
+- Does the subject have a family history of premature coronary disease (MI, coronary artery disease) in their immediate family (before the age of 55)?
+- Does the subject have clinically documented hypertension?
+- Has the subject ever had a peripheral vascular intervention
+- Has the subject ever had a clinically documented stroke?
+- Has the subject ever had clinically documented TIA?
+
+```{r}
+# CV disease questions
+redcap_new %>% dplyr::count(`does_the_subject_have_clinically_documented_coronary_artery_disease_(cad)`)
+redcap_new %>% dplyr::count(has_the_subject_ever_had_a_cardiac_arrest)
+redcap_new %>% dplyr::count(does_the_subject_have_clinically_documented_cardiac_arrhythmias)
+redcap_new %>% dplyr::count(`has_the_subject_ever_had_a_clinically_documented_myocardial_infarction_(mi)`)
+redcap_new %>% dplyr::count(has_the_subject_ever_had_a_clinically_documented_stroke)
+
+# Diabetes
+redcap_new %>% dplyr::count(does_the_subject_have_clinically_documented_diabetes)
+```
+
+Clean up variable names for CV disease and diabetes variables.
+
+```{r}
+redcap_new <- redcap_new %>%
+    dplyr::rename(
+        cad = `does_the_subject_have_clinically_documented_coronary_artery_disease_(cad)`,
+        cardiac_arrest = has_the_subject_ever_had_a_cardiac_arrest,
+        cardiac_arrhythmias = does_the_subject_have_clinically_documented_cardiac_arrhythmias,
+        mi = `has_the_subject_ever_had_a_clinically_documented_myocardial_infarction_(mi)`,
+        stroke = has_the_subject_ever_had_a_clinically_documented_stroke,
+        diabetes = does_the_subject_have_clinically_documented_diabetes
+    ) %>%
+    mutate(
+        cv_disease = cad == "Yes," | cardiac_arrest != "No" | cardiac_arrhythmias == "Yes" | mi != "No" | stroke != "No",
+        diabetes = diabetes != "No",
+        event_name_order = case_when(
+            event_name=="Event 1" ~ 1,
+            event_name=="Followup 6 month" ~ 2,
+            event_name=="Followup Year 1" ~ 3,
+            event_name=="Followup Year 2" ~ 4,
+            event_name=="Study Completion" ~ 5
+        )
+    )
+```
+
+If CV disease or diabetes is present at baseline, should also be present at Year 1. Carry `TRUE`'s forward.
+
+```{r}
+carry_value_forward <- function(x) {
+    if (all(is.na(x))) {
+        rep(NA, length(x))
+    }
+    if (!any(x, na.rm = TRUE)) {
+        x
+    } else {
+        first_true <- which.max(x)
+        x[first_true:length(x)] <- TRUE
+        x
+    }
+}
+temp <- redcap_new %>%
+    group_by(proton_id) %>%
+    arrange(proton_id, event_name_order) %>%
+    mutate(
+        cv_disease = carry_value_forward(cv_disease),
+        diabetes = carry_value_forward(diabetes)
+    )
+```
+
+Patient with proton ID = 1 is an example of diabetes going from TRUE to FALSE from baseline to 6 months - **what is happening here?**
+
+```{r}
+temp %>% filter(proton_id=="1") %>% select(proton_id, event_name, cv_disease, diabetes)
+redcap_new %>% filter(proton_id=="1") %>% select(proton_id, event_name, cv_disease, diabetes)
+redcap  %>% filter(proton_id=="1") %>% select(proton_id, event_name, does_the_subject_have_clinically_documented_diabetes)
+```
+
+```{r}
+redcap_new <- temp
+```
+
+Clean up CV disease and diabetes variables in Canadian data.
+
+```{r}
+can_data_all %>% count(cad)
+can_data_all %>% count(cardiac_arrest)
+can_data_all %>% count(cardiac_arrythmias)
+can_data_all %>% count(mi)
+
+can_data_all %>% count(diabetes)
+
+can_data_all <- can_data_all %>%
+    dplyr::rename(cardiac_arrhythmias = cardiac_arrythmias) %>%
+    mutate(
+        cv_disease = cad == "Yes" | cardiac_arrest != "No" | cardiac_arrhythmias == "Yes" | mi != "No",
+        diabetes = diabetes != "No"
+    )
+```
+
+
+
+
+
+# Cleaning symptom information
+
+## Select and rename symptoms of interest
+
+"During the past 4 weeks, to what extent were you bothered by..."
+
+Main symptoms
+
+- Fatigue: Being washed out or drained?
+- Pruritus: Itchy skin?
+- Anorexia: Lack of appetite?
+
+Secondary symptoms
+
+- Nausea/Vomiting: Nausea or upset stomach?
+- Excessive daytime sleep: Sleepiness during the day?
+- Difficulty concentrating: Difficulty doing activities involving concentrating and thinking?
+- Pain: Bodily pain?
+
+Rename (abbreviate) variables for symptoms of interest.
+
+```{r}
+cn <- colnames(kdqol)
+cn[str_detect(cn, "drain")]
+cn[str_detect(cn, "itch")]
+cn[str_detect(cn, "appetite")]
+cn[str_detect(cn, "naus")]
+cn[str_detect(cn, "day")]
+cn[str_detect(cn, "concen")]
+cn[str_detect(cn, "bodily_pain")]
+cn[str_detect(cn, "one_flight")]
+cn[str_detect(cn, "several_flights")]
+cn[str_detect(cn, "moderate_act")]
+cn[str_detect(cn, "vigorous_act")]
+cn[str_detect(cn, "walking")]
+
+cn[str_detect(cn, "drain")] <- "fatigue"
+cn[str_detect(cn, "itch")] <- "pruritus"
+cn[str_detect(cn, "appetite")] <- "anorexia"
+cn[str_detect(cn, "naus")] <- "nausea_vomiting"
+cn[str_detect(cn, "day")] <- "daytime_sleepiness"
+cn[str_detect(cn, "concen")] <- "difficulty_concentrating"
+cn[str_detect(cn, "bodily_pain")] <- "bodily_pain"
+cn[str_detect(cn, "one_flight")] <- "climb_one_flight"
+cn[str_detect(cn, "several_flights")] <- "climb_several_flights"
+cn[str_detect(cn, "moderate_act")] <- "moderate_activity"
+cn[str_detect(cn, "vigorous_act")] <- "vigorous_activity"
+cn[str_detect(cn, "walking_one")] <- "walk_one_block"
+cn[str_detect(cn, "walking_sev")] <- "walk_several_blocks"
+cn[str_detect(cn, "walking_more")] <- "walk_mile_more"
+
+colnames(kdqol) <- cn
+```
+
+What are the possible responses for the selected symptoms? The grant indicates that the Likert scale responses are translated to a 0-100 scale, but those quantitative scores are not present in the KDQOL data.
+
+```{r}
+kdqol %>% dplyr::count(fatigue)
+kdqol %>% dplyr::count(pruritus)
+kdqol %>% dplyr::count(anorexia)
+kdqol %>% dplyr::count(nausea_vomiting)
+kdqol %>% dplyr::count(daytime_sleepiness)
+kdqol %>% dplyr::count(difficulty_concentrating)
+kdqol %>% dplyr::count(bodily_pain)
+
+kdqol %>% dplyr::count(climb_one_flight)
+kdqol %>% dplyr::count(climb_several_flights)
+kdqol %>% dplyr::count(moderate_activity)
+kdqol %>% dplyr::count(vigorous_activity)
+kdqol %>% dplyr::count(walk_one_block)
+kdqol %>% dplyr::count(walk_several_blocks)
+kdqol %>% dplyr::count(walk_mile_more)
+```
+
+## Recode categories for symptoms: US
+
+```{r}
+recode_categories <- function(x, type = c("type1", "type2", "type3", "type4")) {
+    if (type=="type1") {
+        case_when(
+            x=="Not bothered" ~ "grade1",
+            x=="Somewhat bothered" ~ "grade2",
+            x=="Moderately bothered" ~ "grade3",
+            x=="Very much bothered" ~ "grade4",
+            x=="Extremely bothered" ~ "grade5"
+        )
+    } else if (type=="type2") {
+        case_when(
+            x=="None of the time" ~ "grade1",
+            x=="A little of the time" ~ "grade2",
+            x=="Some of the time" ~ "grade3",
+            x=="A good bit of the time" ~ "grade4",
+            x=="Most of the time" ~ "grade5",
+            x=="All of the time" ~ "grade6"
+        )
+    } else if (type=="type3") {
+        case_when(
+            x=="None" ~ "grade1",
+            x=="Very Mild" ~ "grade2",
+            x=="Mild" ~ "grade3",
+            x=="Moderate" ~ "grade4",
+            x=="Severe" ~ "grade5",
+            x=="Very Severe" ~ "grade6"
+        )
+    } else if (type=="type4") {
+        case_when(
+            x=="No, not limited at all" ~ "grade1",
+            x=="Yes, limited a little" ~ "grade2",
+            x=="Yes, limited a lot" ~ "grade3"
+        )
+    }
+}
+
+kdqol_new <- kdqol %>%
+    mutate(across(c(fatigue, pruritus, anorexia, nausea_vomiting), recode_categories, type = "type1")) %>%
+    mutate(across(c(daytime_sleepiness, difficulty_concentrating), recode_categories, type = "type2")) %>%
+    mutate(bodily_pain = recode_categories(bodily_pain, type = "type3")) %>%
+    mutate(across(c(climb_one_flight, climb_several_flights, moderate_activity, vigorous_activity, walk_one_block, walk_several_blocks, walk_mile_more), recode_categories, type = "type4"))
+```
+
+## Recode categories for symptoms: Canada
+
+Explore coding.
+
+```{r}
+can_data_all %>% dplyr::count(fatigue)
+can_data_all %>% dplyr::count(pruritus)
+can_data_all %>% dplyr::count(anorexia)
+can_data_all %>% dplyr::count(nausea_vomiting)
+can_data_all %>% dplyr::count(daytime_sleepiness)
+can_data_all %>% dplyr::count(difficulty_concentrating)
+can_data_all %>% dplyr::count(bodily_pain)
+
+
+can_data_all %>% dplyr::count(climb_one_flight)
+can_data_all %>% dplyr::count(climb_several_flights)
+can_data_all %>% dplyr::count(moderate_activity)
+can_data_all %>% dplyr::count(vigorous_activity)
+can_data_all %>% dplyr::count(walk_one_block)
+can_data_all %>% dplyr::count(walk_several_blocks)
+can_data_all %>% dplyr::count(walk_mile_more)
+```
+
+Recode categories.
+
+```{r}
+recode_categories_canada <- function(x, type = c("type1", "type2", "type3", "type4")) {
+    if (type=="type1") {
+        case_when(
+            x=="Not At All Bothered" ~ "grade1",
+            x=="Somewhat Bothered" ~ "grade2",
+            x=="Moderately Bothered" ~ "grade3",
+            x=="Very Much Bothered" ~ "grade4",
+            x=="Extremely Bothered" ~ "grade5"
+        )
+    } else if (type=="type2") {
+        case_when(
+            x=="None Of The Time" ~ "grade1",
+            x=="A Little Of The Time" ~ "grade2",
+            x=="Some Of The Time" ~ "grade3",
+            x=="A Good Bit Of The Time" ~ "grade4",
+            x=="Most Of The Time" ~ "grade5",
+            x=="All Of The Time" ~ "grade6"
+        )
+    } else if (type=="type3") {
+        case_when(
+            x=="None" ~ "grade1",
+            x=="Very Mild" ~ "grade2",
+            x=="Mild" ~ "grade3",
+            x=="Moderate" ~ "grade4",
+            x=="Severe" ~ "grade5",
+            x=="Very Severe" ~ "grade6"
+        )
+    } else if (type=="type4") {
+        case_when(
+            x=="No, Not Limited At All" ~ "grade1",
+            x=="Yes, Limited A Little" ~ "grade2",
+            x=="Yes, Limited A Lot" ~ "grade3"
+        )
+    }
+}
+
+can_data_all <- can_data_all %>%
+    mutate(across(c(fatigue, pruritus, anorexia, nausea_vomiting), recode_categories_canada, type = "type1")) %>%
+    mutate(across(c(daytime_sleepiness, difficulty_concentrating), recode_categories_canada, type = "type2")) %>%
+    mutate(bodily_pain = recode_categories_canada(bodily_pain, type = "type3")) %>%
+    mutate(across(c(climb_one_flight, climb_several_flights, moderate_activity, vigorous_activity, walk_one_block, walk_several_blocks, walk_mile_more), recode_categories, type = "type4"))
+```
+
+
+
+
+
+# Merge metabolomics and covariate data
+
+```{r}
+se_c8 <- merge_redcap_kdqol(se_c8, redcap_new, kdqol_new)
+se_hilic_pos <- merge_redcap_kdqol(se_hilic_pos, redcap_new, kdqol_new)
+se_hilic_neg <- merge_redcap_kdqol(se_hilic_neg, redcap_new, kdqol_new)
+
+se_c8_split <- split_experiment(se_c8)
+se_hilic_pos_split <- split_experiment(se_hilic_pos)
+se_hilic_neg_split <- split_experiment(se_hilic_neg)
+```
+
+
+The `.x` and `.y` on `sample_id` indicate a `sample_id` column in the Broad metabolomics data and in the Redcap data, respectively, that don't match (even though the proton IDs do).
+
+- Most are not true mismatches. Broad IDs have an "LU-", "SLU-", or "ILU-" in front of the number and the Redcap data just have the trailing number. Generally, these match up.
+- There are 4 instances of other mismatches that look typos.
+
+```{r}
+check_mismatch_sample_ids <- function(se) {
+    colData(se) %>%
+        as.data.frame() %>%
+        filter(sample_id.x != sample_id.y) %>%
+        select(starts_with("sample_id"), proton_id) %>%
+        mutate(sample_id_num = as.character(as.integer(str_extract(sample_id.x, "[0-9]+$")))) %>%
+        filter(sample_id_num != sample_id.y)
+}
+
+check_mismatch_sample_ids(se_c8)
+check_mismatch_sample_ids(se_hilic_pos)
+check_mismatch_sample_ids(se_hilic_neg)
+```
+
+C8 should be the only injection that contains duplicated sample IDs (yes), and they should be ILU-0036, ILU-2143, LU-2040, SLU-2003 (yes).
+
+```{r}
+colData(se_c8) %>% as.data.frame() %>% filter(duplicated(sample_id.x)) %>% select(starts_with("sample"))
+
+colData(se_hilic_pos) %>% as.data.frame() %>% filter(duplicated(sample_id.x)) %>% select(starts_with("sample"))
+
+colData(se_hilic_neg) %>% as.data.frame() %>% filter(duplicated(sample_id.x)) %>% select(starts_with("sample"))
+```
+
+Some variables are in both the Redcap and KDQOL data.
+
+```{r}
+cn <- colnames(colData(se_c8))
+cn[str_detect(cn, "\\.[xy]")] %>% sort()
+```
+
+
+
+
+
+# Check sample sizes and duplicated IDs
+
+```{r}
+check_sample_sizes_dups(se_c8, se_c8_split)
+```
+
+```{r}
+check_sample_sizes_dups(se_hilic_pos, se_hilic_pos_split)
+```
+
+```{r}
+check_sample_sizes_dups(se_hilic_neg, se_hilic_neg_split)
+```
+
+Check that there is overlap in the patients in the discovery and validation cohorts. **Yes, in terms of Proton IDs (not sample IDs).**
+
+- Length of intersection for US should be 150. (There are 150 patients who had both baseline and year 1 visits.)
+- For Canada, the `sample_id` variable is the `cbsr_id` variable which identifies the blood sample. A patient with both baseline and year 1 samples has 2 different IDs for this ID. Thus, the intersection is empty.
+
+```{r}
+cd <- colData(se_c8) %>% as.data.frame()
+pids_us_baseline <- cd %>%
+    filter(country=="US", event_name=="Baseline") %>%
+    pull(proton_id)
+pids_us_year1 <- cd %>%
+    filter(country=="US", event_name=="Year 1") %>%
+    pull(proton_id)
+
+sids_canada_baseline <- cd %>%
+    filter(country=="Canada", event_name=="Baseline") %>%
+    pull(sample_id.x)
+sids_canada_year1 <- cd %>%
+    filter(country=="Canada", event_name=="Year 1") %>%
+    pull(sample_id.x)
+
+intersect(pids_us_baseline, pids_us_year1)
+intersect(sids_canada_baseline, sids_canada_year1)
+```
+
+
+
+
+
+# QC: Sample drift and batch effects
+
+## Concordance between technical duplicates
+
+```{r}
+se_c8_main <- se_c8_split$main
+cd <- colData(se_c8_main) %>% as.data.frame()
+cd %>%
+    filter(is_tech_dup) %>%
+    select(sample_id.x, proton_id, injection_order, date_extracted, date_injected) %>%
+    arrange(injection_order)
+
+plot_technical_dups(se_c8_main, proton_id = "36", xlim = c(0,30), ylim = c(-12,12))
+plot_technical_dups(se_c8_main, proton_id = "577950", xlim = c(0,30), ylim = c(-12,12))
+plot_technical_dups(se_c8_main, proton_id = "143", xlim = c(0,30), ylim = c(-12,12))
+plot_technical_dups(se_c8_main, proton_id = "100893", xlim = c(0,30), ylim = c(-12,12))
+```
+
+## Sample drift for QC samples
+
+```{r}
+plot_qc_drift(se_c8_split$main, sample_descrip = "C8 - Main", include_subtitle_corr = TRUE)
+plot_qc_drift(se_c8_split$qc_a, sample_descrip = "C8 - PREFA", include_subtitle_corr = TRUE)
+plot_qc_drift(se_c8_split$qc_b, sample_descrip = "C8 - PREFB", include_subtitle_corr = TRUE)
+
+plot_qc_drift(se_hilic_pos_split$main, sample_descrip = "HILIC pos - Main", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_pos_split$qc_a, sample_descrip = "HILIC pos - PREFA", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_pos_split$qc_b, sample_descrip = "HILIC pos - PREFB", include_subtitle_corr = TRUE)
+
+plot_qc_drift(se_hilic_neg_split$main, sample_descrip = "HILIC neg - Main", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_neg_split$qc_a, sample_descrip = "HILIC neg - PREFA", include_subtitle_corr = TRUE)
+plot_qc_drift(se_hilic_neg_split$qc_b, sample_descrip = "HILIC neg - PREFB", include_subtitle_corr = TRUE)
+```
+
+
+## Coefficient of variation distributions
+
+```{r}
+png("../results/figures/cv_dists.png", width = 1300, height = 500)
+par(mfrow = c(1,3))
+plot_cv_dists(se_c8_split, "C8", xlim = c(0,1))
+plot_cv_dists(se_hilic_pos_split, "HILIC (pos)", xlim = c(0,10))
+plot_cv_dists(se_hilic_neg_split, "HILIC (neg)", xlim = c(0,10))
+dev.off()
+```
+
+
+
+## PCA
+
+### C8
+
+```{r}
+plot_pc_info(se_c8_split$main, sample_descrip = "C8: Main")
+plot_pc_info(se_c8_split$qc_a, sample_descrip = "C8: PREFA")
+plot_pc_info(se_c8_split$qc_b, sample_descrip = "C8: PREFB")
+```
+
+
+### HILIC (positive ion mode)
+
+```{r}
+plot_pc_info(se_hilic_pos_split$main, sample_descrip = "HILIC (pos): Main")
+plot_pc_info(se_hilic_pos_split$qc_a, sample_descrip = "HILIC (pos): PREFA")
+plot_pc_info(se_hilic_pos_split$qc_b, sample_descrip = "HILIC (pos): PREFB")
+```
+
+
+### HILIC (negative ion mode)
+
+```{r}
+plot_pc_info(se_hilic_neg_split$main, sample_descrip = "HILIC (neg): Main")
+plot_pc_info(se_hilic_neg_split$qc_a, sample_descrip = "HILIC (neg): PREFA")
+plot_pc_info(se_hilic_neg_split$qc_b, sample_descrip = "HILIC (neg): PREFB")
+```
+
+
+
+
+
+# Remove technical duplicates from C8
+
+Identify samples to remove by their `proton_id` and `injection_order`.
+
+```{r}
+cd <- colData(se_c8_main) %>% as.data.frame()
+cd %>%
+    filter(is_tech_dup) %>%
+    select(sample_id.x, proton_id, injection_order, date_extracted, date_injected) %>%
+    arrange(injection_order)
+
+bool_remove <- cd$is_tech_dup & cd$injection_order %in% c(1020, 1033, 1080, 1102)
+
+se_c8_main <- se_c8_main[,!bool_remove]
+```
+
+
+
+
+
+# Compound IDs and metabolite redundancy
+
+Check to see whether compound IDs indicate the same metabolites across injections. **NO, THEY DON'T.**
+
+```{r}
+reformat_rowdata <- function(se) {
+    rowData(se) %>% 
+        as.data.frame() %>% 
+        select(-method) %>% 
+        mutate(
+            hmdb_id_certainty = as.character(hmdb_id_certainty),
+            metabolite = ifelse(is.na(metabolite), "unknown", metabolite)
+        )
+}
+
+se_hilic_pos_main <- se_hilic_pos_split$main
+se_hilic_neg_main <- se_hilic_neg_split$main
+
+rd_c8 <- reformat_rowdata(se_c8_main) %>%
+    dplyr::rename(metab_c8 = metabolite)
+rd_hilic_pos <- reformat_rowdata(se_hilic_pos_main) %>%
+    dplyr::rename(metab_hilic_pos = metabolite)
+rd_hilic_neg <- reformat_rowdata(se_hilic_neg_main) %>%
+    dplyr::rename(metab_hilic_neg = metabolite)
+
+all_compound_ids <- unique(c(rd_c8$compound_id, rd_hilic_pos$compound_id, rd_hilic_neg$compound_id))
+
+metab_ids <- tibble(compound_id = all_compound_ids) %>%
+    left_join(select(rd_c8, compound_id, metab_c8)) %>%
+    left_join(select(rd_hilic_pos, compound_id, metab_hilic_pos)) %>%
+    left_join(select(rd_hilic_neg, compound_id, metab_hilic_neg))
+
+head(metab_ids)
+tail(metab_ids)
+
+num_metabs_per_cid <- sapply(seq_len(nrow(metab_ids)), function(i) {
+    cols <- paste0("metab_", c("c8", "hilic_pos", "hilic_neg"))
+    metabs <- as.character(metab_ids[i,cols])
+    length(setdiff(metabs, NA))
+})
+table(num_metabs_per_cid)
+
+metab_ids[num_metabs_per_cid==3,]
+head(metab_ids[num_metabs_per_cid==2,])
+```
+
+What is the overlap between metabolites measured across the different injections?
+
+```{r}
+rd_c8 <- rd_c8 %>%
+    dplyr::rename(metabolite = metab_c8)
+rd_hilic_pos <- rd_hilic_pos %>%
+    dplyr::rename(metabolite = metab_hilic_pos)
+rd_hilic_neg <- rd_hilic_neg %>%
+    dplyr::rename(metabolite = metab_hilic_neg)
+
+all_metabs <- full_join(rd_c8, rd_hilic_pos) %>% full_join(rd_hilic_neg) %>%
+    mutate(
+        c8 = metabolite %in% rd_c8$metabolite,
+        hilic_pos = metabolite %in% rd_hilic_pos$metabolite,
+        hilic_neg = metabolite %in% rd_hilic_neg$metabolite
+    )
+
+all_metabs %>%
+    filter(metabolite != "unknown") %>%
+    dplyr::count(c8, hilic_pos, hilic_neg) %>%
+    arrange(n)
+```
+
+## Explore Eugene's annotations on metabolite redundancy
+
+Read in Eugene's annotations.
+
+```{r}
+metab_redundancy <- read_excel("../data/Broad data--redundant metabolites_02032022.xlsx", sheet = "Sheet1", range = "A1:I665", col_names = TRUE)
+colnames(metab_redundancy) <- fix_names(colnames(metab_redundancy))
+metab_redundancy <- metab_redundancy %>% select(-`...6`)
+```
+
+Explore annotations.
+
+- Compounds that are marked as "redundant - are these compounds are measured in multiple injections? Yes, but these are instances where:
+    - The HMDB ID indicates that the peak is a redundant ion of a compound that should be quantified with a main ion.
+    - A single HMDB ID has different `metabolite` names.
+
+```{r}
+metab_redundancy %>% dplyr::count(can_omit, comment)
+
+metab_redundancy_c8 <- metab_redundancy %>%
+    filter(method=="C8-pos") %>%
+    dplyr::rename(can_omit_c8 = can_omit, comment_c8 = comment) %>%
+    select(-method)
+metab_redundancy_hilic_pos <- metab_redundancy %>%
+    filter(method=="HIL-pos") %>%
+    dplyr::rename(can_omit_hilic_pos = can_omit, comment_hilic_pos = comment) %>%
+    select(-method)
+metab_redundancy_hilic_neg <- metab_redundancy %>%
+    filter(method=="HIL-neg") %>%
+    dplyr::rename(can_omit_hilic_neg = can_omit, comment_hilic_neg = comment) %>%
+    select(-method)
+
+all_metabs_annot <- all_metabs %>%
+    filter(metabolite != "unknown") %>%
+    full_join(metab_redundancy_c8) %>%
+    full_join(metab_redundancy_hilic_pos) %>%
+    full_join(metab_redundancy_hilic_neg)
+
+all_metabs_annot_check <- all_metabs_annot %>%
+    filter(!is.na(can_omit_c8) | !is.na(can_omit_hilic_pos) | !is.na(can_omit_hilic_neg) | !is.na(comment_c8) | !is.na(comment_hilic_pos) | !is.na(comment_hilic_neg))
+
+all_metabs_annot_check <- all_metabs_annot_check %>%
+    filter((c8+hilic_pos+hilic_neg)==1, comment_c8 == "redundant" | comment_hilic_pos == "redundant" | comment_hilic_neg == "redundant") %>%
+    filter(!str_detect(hmdb_id, "redun"))
+```
+
+These metabolites (marked "redundant") apparently were only measured in HILIC-pos, but their HMDB IDs are duplicated in at least one of the other injections.
+
+```{r}
+(all_metabs_annot_check$hmdb_id[1:5] %in% rd_c8$hmdb_id) | (all_metabs_annot_check$hmdb_id[1:5] %in% rd_hilic_neg$hmdb_id)
+```
+
+These metabolites (marked "redundant") apparently were only measured in HILIC-neg, but their HMDB IDs are duplicated in at least one of the other injections.
+
+```{r}
+(all_metabs_annot_check$hmdb_id[6:7] %in% rd_c8$hmdb_id) | (all_metabs_annot_check$hmdb_id[6:7] %in% rd_hilic_neg$hmdb_id)
+```
+
+## Remove redundant metabolites across injections
+
+```{r}
+se_c8_main <- remove_metabolites(se_c8_main, metab_redundancy, injection = "C8-pos", row_data_col = "metabolite")
+se_hilic_pos_main <- remove_metabolites(se_hilic_pos_main, metab_redundancy, injection = "HIL-pos", row_data_col = "metabolite")
+se_hilic_neg_main <- remove_metabolites(se_hilic_neg_main, metab_redundancy, injection = "HIL-neg", row_data_col = "metabolite")
+```
+
+
+
+
+
+# Merge Canadian, IU, and Frenova data into SummExps
+
+Read in IU and Frenova data.
+
+```{r}
+# Data to link IDs in MGH-Frenova
+ids_mgh_frenova <- read_excel("../data/LUCID_MGH/Lucid identifiers 102621.xlsx")
+
+# Frenova labs
+frenova_labs <- read_csv("../data/LUCID-Frenova Data/Original/DataFromMGH/lab.csv")
+frenova_pt <- read_csv("../data/LUCID-Frenova Data/Original/DataFromMGH/pt.csv")
+
+# IU labs
+iu_labs1_baseline <- read_excel("../data/LUCID Data From IU/2021_11_13/LUCID_clinical_data_1.xlsx", sheet = "Baseline")
+iu_labs1_year1 <- read_excel("../data/LUCID Data From IU/2021_11_13/LUCID_clinical_data_1.xlsx", sheet = "Year 1")
+
+iu_labs2_baseline <- read_excel("../data/LUCID Data From IU/2021_11_13/LUCID_clinical_data_2.xlsx", sheet = "baseline")
+iu_labs2_year1 <- read_excel("../data/LUCID Data From IU/2021_11_13/LUCID_clinical_data_2.xlsx", sheet = "year1")
+```
+
+Combine IU data into one data.frame.
+
+```{r}
+clean_up_lab_vals <- function(x) {
+    x <- tolower(x)
+    x[x=="."] <- NA
+    x[x=="n/a"] <- NA
+    x <- str_remove(x, " as of .*")
+    as.numeric(x)
+}
+
+iu_labs1_baseline <- iu_labs1_baseline %>%
+    mutate(event_name = "Baseline") %>%
+    select(ID, event_name, alb = alb_0, hgb = Hgb_0, ferritin = Fer_0, phosph = phos_0, ipth = PTH_0) %>%
+    mutate(across(alb:ipth, clean_up_lab_vals))
+iu_labs1_year1 <- iu_labs1_year1 %>%
+    filter(ID != ".") %>% # remove the one row with ID = "."
+    mutate(event_name = "Year 1", ID = as.numeric(ID)) %>%
+    select(ID, event_name, alb = alb_0, hgb = Hgb_0, ferritin = Fer_0, phosph = phos_0, ipth = PTH_0) %>%
+    mutate(across(alb:ipth, clean_up_lab_vals))
+
+iu_labs2_baseline <- iu_labs2_baseline %>%
+    mutate(event_name = "Baseline") %>%
+    select(ID, event_name, alb = alb_0, hgb = Hgb_0, ferritin = Fer_0, phosph = phos_0, ipth = PTH_0) %>%
+    mutate(across(alb:ipth, clean_up_lab_vals))
+iu_labs2_year1 <- iu_labs2_year1 %>%
+    mutate(event_name = "Year 1") %>%
+    select(ID, event_name, alb = alb_0, hgb = Hgb_0, ferritin = Fer, phosph = phos_0, ipth = PTH_0) %>%
+    mutate(across(alb:ipth, clean_up_lab_vals))
+
+iu_labs <- bind_rows(
+    iu_labs1_baseline, iu_labs1_year1,
+    iu_labs2_baseline, iu_labs2_year1
+)
+iu_labs <- iu_labs %>%
+    mutate(site = "Indiana", sample_id_mod = paste0("ILU-", ID))
+
+rm(iu_labs1_baseline, iu_labs1_year1, iu_labs2_baseline, iu_labs2_year1)
+```
+
+There are some duplicated rows in `iu_labs` - remove them.
+
+```{r}
+dim(iu_labs)
+dim(unique(iu_labs))
+iu_labs <- unique(iu_labs)
+```
+
+Add `proton_id` to `frenova_labs`.
+
+```{r}
+ids_mgh_frenova <- ids_mgh_frenova %>%
+    select(PATIENT_ID_MGH = `Sample ID`, proton_id = `Proton ID`)
+frenova_labs <- left_join(frenova_labs, ids_mgh_frenova) %>%
+    mutate(
+        LAB_DATE = mdy(LAB_DATE),
+        proton_id = as.character(proton_id),
+        sample_id_mod = paste0("LU-", PATIENT_ID_MGH),
+        site = "MGH"
+    ) %>%
+    select(sample_id_mod, proton_id, site, lab_date = LAB_DATE, alb, hgb, ferritin, phosph, ipth, daug_spktv)
+
+dim(frenova_labs)
+dim(unique(frenova_labs))
+```
+
+Merging in the Frenova data: need to compute time difference between lab dates and Redcap record dates to match the closest lab to a LUCID visit date.
+
+```{r}
+insert_us_labs <- function(se, frenova_labs, iu_labs) {
+    cd <- colData(se) %>% as.data.frame() %>%
+        mutate(
+            sample_id_num = as.integer(str_extract(sample_id.x, "[0-9]+$")),
+            sample_id_mod = paste0(str_extract(sample_id.x, "^[A-Z]+-"),sample_id_num),
+            date_sample_collected = ymd(date_sample_collected)
+        )
+    
+    lab_data_frenova <- cd %>%
+        filter(site=="MGH") %>%
+        left_join(frenova_labs, by = c("proton_id", "sample_id_mod", "site")) %>%
+        mutate(diff_date = abs(as.integer(lab_date - date_sample_collected))) %>%
+        group_by(proton_id, sample_id.x) %>%
+        arrange(diff_date) %>%
+        summarize(across(alb:daug_spktv, first)) %>%
+        select(proton_id, sample_id.x, alb, hgb, ferritin, phosph, ipth, ktv = daug_spktv)
+    
+    lab_data_iu <- cd %>%
+        filter(site=="Indiana") %>%
+        left_join(iu_labs, by = c("sample_id_mod", "site", "event_name")) %>%
+        select(proton_id, sample_id.x, alb, hgb, ferritin, phosph, ipth) %>%
+        mutate(ktv = NA_real_)
+    
+    lab_data <- bind_rows(lab_data_frenova, lab_data_iu)
+    
+    cd <- cd %>% left_join(lab_data, by = c("proton_id", "sample_id.x"))
+    cd <- as(cd, "DataFrame")
+    colData(se) <- cd
+    se
+}
+
+se_c8_main <- insert_us_labs(se_c8_main, frenova_labs, iu_labs)
+se_hilic_pos_main <- insert_us_labs(se_hilic_pos_main, frenova_labs, iu_labs)
+se_hilic_neg_main <- insert_us_labs(se_hilic_neg_main, frenova_labs, iu_labs)
+```
+
+Clean up variable names in Canadian data.
+
+```{r}
+can_data_all <- can_data_all %>%
+    mutate(interview = ifelse(interview=="Baseline", "Baseline", "Year 1")) %>%
+    rename(sample_id.x = cbsr_id, event_name = interview, dry_weight = dryweight, alb = ALB, hgb = HB, ferritin = FER, phosph = PO4, ipth = PTH, dialysis_duration = daysinterview, does_the_subject_have_clinically_documented_hypertension = hypertension)
+```
+
+
+```{r}
+insert_canadian_data <- function(se) {
+    cd <- colData(se) %>% as.data.frame() %>%
+        dplyr::rename(esrd_cause = what_is_the_primary_cause_of_esrd, height = height_.cm.) %>%
+        mutate(dry_weight = as.numeric(str_remove(dry_weight, "[:alpha:]")))
+    
+    cd_us <- cd %>%
+        filter(country=="US")
+    cd_canada <- cd %>%
+        filter(country=="Canada") %>%
+        select(proton_id, sample_id.x, event_name, country) %>%
+        left_join(can_data_all, by = c("sample_id.x", "event_name"))
+    cd <- full_join(cd_us, cd_canada)
+    cd <- as(cd, "DataFrame")
+    colData(se) <- cd
+    se
+}
+
+se_c8_main <- insert_canadian_data(se_c8_main)
+se_hilic_pos_main <- insert_canadian_data(se_hilic_pos_main)
+se_hilic_neg_main <- insert_canadian_data(se_hilic_neg_main)
+```
+
+Check available data on mortality.
+
+- The `daysdeath` variable is available in the Canadian data. It represents the number of days from dialysis initiation to death. Many Canadian patients did not die during the follow up period.
+- We can try to compute the equivalent of the `daysdeath` variable in the US with `date_of_death` and `date_of_first_dialysis`. Although in the full Redcap file, there are some patients with a recorded date of death, the subset of patients in LUCID ***all*** do not have a recorded date of death (in Redcap). We can look to external information specifically for the Fresenius (Frenova) patients for date of death information.
+- All Canadian and Frenova patients were followed up for 2 years from baseline.
+
+```{r}
+cd <- colData(se_c8_main) %>% as.data.frame() %>% as_tibble()
+
+cd %>% filter(country=="US") %>%
+    count(is.na(date_of_death))
+
+cd %>% filter(country=="US") %>%
+    count(is.na(date_of_first_dialysis))
+
+cd %>% filter(country=="Canada") %>%
+    count(event_name, is.na(daysdeath))
+```
+
+Link Frenova data to colData.
+
+```{r}
+frenova_pt <- left_join(frenova_pt, ids_mgh_frenova, by = "PATIENT_ID_MGH") %>%
+    mutate(proton_id = as.character(proton_id)) %>%
+    select(
+        proton_id,
+        start_date_fren = START_DATE,
+        end_date_fren = END_DATE,
+        first_dialysis_date_fren = FIRST_DIALYSIS_EVER,
+        date_of_death_fren = DATE_OF_DEATH,
+        cause_of_death_fren = CAUSE_OF_DEATH) %>%
+    mutate(across(contains("date"), mdy))
+
+organize_mort_info <- function(se) {
+    cd <- colData(se) %>% as.data.frame()
+    cd$frenova <- cd$proton_id %in% frenova_pt$proton_id
+    cd <- left_join(cd, frenova_pt, by = "proton_id")
+    cd <- cd %>% mutate(
+        daysdeath_fren = date_of_death_fren - first_dialysis_date_fren,
+        daysdeath = ifelse(frenova, daysdeath_fren, daysdeath)
+    )
+    cd <- as(cd, "DataFrame")
+    colData(se) <- cd
+    se
+}
+
+se_c8_main <- organize_mort_info(se_c8_main)
+se_hilic_pos_main <- organize_mort_info(se_hilic_pos_main)
+se_hilic_neg_main <- organize_mort_info(se_hilic_neg_main)
+```
+
+
+
+
+
+# Fill in missing values for height, weight, BMI
+
+Check missing values for height, weight, and BMI.
+
+```{r}
+cd %>% count(is.na(height), is.na(dry_weight), is.na(bmi))
+```
+
+Compute missing values when the other two values are present. Fill in missing values for height at Year 1 when information is available for baseline.
+
+```{r}
+compute_ht_wt_bmi <- function(se) {
+    cd <- colData(se) %>% as.data.frame()
+    miss_ht <- is.na(cd$height)
+    miss_wt <- is.na(cd$dry_weight)
+    miss_bmi <- is.na(cd$bmi)
+    have_ht_wt <- !miss_ht & !miss_wt
+    have_ht_bmi <- !miss_ht & !miss_bmi
+    have_wt_bmi <- !miss_wt & !miss_bmi
+    cd <- cd %>%
+        mutate(
+            bmi = case_when(
+                have_ht_wt ~ dry_weight/((height/100)^2),
+                TRUE ~ bmi
+            ),
+            dry_weight = case_when(
+                have_ht_bmi ~ bmi*((height/100)^2),
+                TRUE ~ dry_weight
+            ),
+            height = case_when(
+                have_wt_bmi ~ sqrt(dry_weight/bmi)*100,
+                TRUE ~ height
+            )
+        )
+    cd <- cd %>% 
+        mutate(id = if_else(country=="Canada", studynum, proton_id))
+    
+    cd_heights <- cd %>% 
+        filter(event_name=="Baseline") %>% 
+        select(id, height_baseline = height) %>% 
+        unique()
+    
+    cd <- left_join(cd, cd_heights, by = "id") %>% 
+        mutate(height = if_else(is.na(height), height_baseline, height)) %>% 
+        select(-height_baseline)
+    
+    colData(se) <- as(cd, "DataFrame")
+    se
+}
+
+se_c8_main <- compute_ht_wt_bmi(se_c8_main)
+se_hilic_pos_main <- compute_ht_wt_bmi(se_hilic_pos_main)
+se_hilic_neg_main <- compute_ht_wt_bmi(se_hilic_neg_main)
+```
+
+
+
+
+
+# Save data before filtering metabolites
+
+```{r}
+save(se_c8_main, se_hilic_pos_main, se_hilic_neg_main, file = "../data/summ_exps_clean_pre_filter.rda")
+```
+
+
+
+
+
+# Filtering metabolites based on missingness and zero variance
+
+- Remove metabolites with >= 95% missingness
+- Remove metabolites where the variance in abundance among non-missing values is zero
+
+```{r}
+se_c8_main <- filter_metabs(se_c8_main)
+se_hilic_pos_main <- filter_metabs(se_hilic_pos_main)
+se_hilic_neg_main <- filter_metabs(se_hilic_neg_main)
+```
+
+
+
+
+
+# Transforming the units of the Canadian lab data
+
+```{r}
+rescale_canada_labs <- function(cd, what_lab, mult_factor) {
+    conversion_vec <- case_when(
+        cd$country == "Canada" ~ mult_factor,
+        cd$country == "US" ~ 1
+    )
+    cd[[what_lab]] <- cd[[what_lab]] * conversion_vec
+    cd
+}
+
+all_labs <- c("alb", "CA", "CRE", "hgb", "IRON", "phosph", "TIBC")
+mult_factors <- c(0.1, 4, 0.0113, 0.1, 1/0.179, 1/0.3229, 5.59)
+
+for (i in seq_along(all_labs)) {
+    colData(se_c8_main) <- rescale_canada_labs(cd = colData(se_c8_main), what_lab = all_labs[i], mult_factor = mult_factors[i])
+    colData(se_hilic_pos_main) <- rescale_canada_labs(cd = colData(se_hilic_pos_main), what_lab = all_labs[i], mult_factor = mult_factors[i])
+    colData(se_hilic_neg_main) <- rescale_canada_labs(cd = colData(se_hilic_neg_main), what_lab = all_labs[i], mult_factor = mult_factors[i])
+}
+
+for (i in seq_along(all_labs)) {
+    print(all_labs[i])
+    cd <- colData(se_c8_main) %>% as.data.frame()
+    cd_us <- cd %>% filter(country=="US")
+    cd_can <- cd %>% filter(country=="Canada")
+    print(summary(cd_us[[all_labs[i]]]))
+    print(summary(cd_can[[all_labs[i]]]))
+}
+```
+
+# Save clean data
+
+```{r}
+save(se_c8_main, se_hilic_pos_main, se_hilic_neg_main, file = "../data/summ_exps_clean.rda")
+```
+
+
+
+
+
+
